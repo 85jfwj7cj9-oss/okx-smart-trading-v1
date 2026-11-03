@@ -1,0 +1,178 @@
+import numpy as np
+import pandas as pd
+import pytest
+
+from indicators import IndicatorEngine
+
+
+def make_data(rows=250):
+    x = np.arange(rows)
+
+    close = (
+        100
+        + x * 0.15
+        + 3 * np.sin(x / 8)
+    )
+
+    return pd.DataFrame({
+        "open": close - 0.2,
+        "high": close + 1.0,
+        "low": close - 1.0,
+        "close": close,
+        "volume": 1000 + x * 2
+    })
+
+
+def test_validate_data():
+    df = make_data()
+
+    result = IndicatorEngine.validate_data(df)
+
+    assert len(result) == 250
+    assert "close" in result.columns
+
+
+def test_validate_missing_column():
+    df = make_data().drop(columns=["volume"])
+
+    with pytest.raises(ValueError):
+        IndicatorEngine.validate_data(df)
+
+
+def test_validate_invalid_price():
+    df = make_data()
+    df.loc[0, "high"] = 1
+
+    with pytest.raises(ValueError):
+        IndicatorEngine.validate_data(df)
+
+
+def test_ema():
+    df = make_data()
+
+    result = IndicatorEngine.ema(df["close"], 20)
+
+    assert len(result) == len(df)
+    assert result.notna().any()
+
+
+def test_rsi():
+    df = make_data()
+
+    result = IndicatorEngine.rsi(df["close"])
+
+    valid = result.dropna()
+
+    assert len(valid) > 0
+    assert ((valid >= 0) & (valid <= 100)).all()
+
+
+def test_macd():
+    df = make_data()
+
+    result = IndicatorEngine.macd(df["close"])
+
+    assert "macd" in result.columns
+    assert "macd_signal" in result.columns
+    assert "macd_hist" in result.columns
+
+
+def test_atr():
+    df = make_data()
+
+    result = IndicatorEngine.atr(df)
+
+    assert result.dropna().gt(0).all()
+
+
+def test_dmi_adx():
+    df = make_data()
+
+    result = IndicatorEngine.dmi_adx(df)
+
+    assert "plus_di" in result.columns
+    assert "minus_di" in result.columns
+    assert "adx" in result.columns
+
+    valid = result["adx"].dropna()
+    assert ((valid >= 0) & (valid <= 100)).all()
+
+
+def test_bollinger_bands():
+    df = make_data()
+
+    result = IndicatorEngine.bollinger_bands(df["close"])
+
+    assert "bb_upper" in result.columns
+    assert "bb_middle" in result.columns
+    assert "bb_lower" in result.columns
+
+    valid = result.dropna()
+
+    assert (
+        valid["bb_upper"] >= valid["bb_middle"]
+    ).all()
+
+    assert (
+        valid["bb_middle"] >= valid["bb_lower"]
+    ).all()
+
+
+def test_obv():
+    df = make_data()
+
+    result = IndicatorEngine.obv(
+        df["close"], df["volume"]
+    )
+
+    assert len(result) == len(df)
+    assert result.notna().all()
+
+
+def test_supertrend():
+    df = make_data()
+
+    result = IndicatorEngine.supertrend(df)
+
+    assert "supertrend" in result.columns
+    assert "supertrend_direction" in result.columns
+
+    directions = set(
+        result["supertrend_direction"].unique()
+    )
+
+    assert directions.issubset({-1, 0, 1})
+
+
+def test_calculate_all():
+    df = make_data()
+
+    result = IndicatorEngine.calculate_all(df)
+
+    expected_columns = [
+        "ema_7",
+        "ema_20",
+        "ema_50",
+        "ema_100",
+        "ema_200",
+        "rsi_14",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "atr_14",
+        "plus_di",
+        "minus_di",
+        "adx",
+        "bb_upper",
+        "bb_middle",
+        "bb_lower",
+        "obv",
+        "volume_ma_20",
+        "supertrend",
+        "supertrend_direction"
+    ]
+
+    for column in expected_columns:
+        assert column in result.columns
+
+    assert len(result) == len(df)
