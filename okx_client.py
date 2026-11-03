@@ -1,95 +1,157 @@
 
 import os
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 
-from flask import Flask, jsonify
-
-app = Flask(__name__)
-
-APP_NAME = "OKX SMART TRADING V1.0"
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei")
+import requests
 
 
-def current_time():
-    try:
-        return datetime.now(ZoneInfo(TIMEZONE)).isoformat()
-    except Exception:
-        return datetime.now().astimezone().isoformat()
+class OKXAPIError(Exception):
+    """OKX API request or response error."""
+    pass
 
 
-@app.route("/")
-def home():
-    return f"""
-    <!DOCTYPE html>
-    <html lang="zh-Hant">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
-        <title>{APP_NAME}</title>
-        <style>
-            body {{
-                margin: 0;
-                padding: 24px;
-                background: #101827;
-                color: white;
-                font-family: Arial, sans-serif;
-            }}
-            .panel {{
-                max-width: 600px;
-                margin: 50px auto;
-                padding: 28px;
-                background: #1e293b;
-                border-radius: 16px;
-            }}
-            .status {{
-                color: #4ade80;
-                font-weight: bold;
-            }}
-            a {{ color: #60a5fa; }}
-        </style>
-    </head>
-    <body>
-        <div class="panel">
-            <h1>{APP_NAME}</h1>
-            <p class="status">● 網頁伺服器已啟動</p>
-            <p>系統版本：V1.0</p>
-            <p>交易模式：模擬觀察，不自動下單</p>
-            <p>目前階段：基礎伺服器建立</p>
-            <hr>
-            <p><a href="/health">系統健康檢查</a></p>
-            <p><a href="/api/status">系統 API 狀態</a></p>
-        </div>
-    </body>
-    </html>
-    """
+class OKXClient:
+    def __init__(self):
+        self.base_url = os.getenv(
+            "OKX_BASE_URL",
+            "https://www.okx.com"
+        ).rstrip("/")
 
+        self.timeout = 15
+        self.session = requests.Session()
 
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "application": APP_NAME,
-        "time": current_time()
-    })
+        self.session.headers.update({
+            "User-Agent": "OKX-SMART-TRADING-V1.0"
+        })
 
+    def _request(self, endpoint, params=None):
+        url = self.base_url + endpoint
 
-@app.route("/api/status")
-def api_status():
-    return jsonify({
-        "application": APP_NAME,
-        "version": "1.0.0",
-        "status": "running",
-        "trading_mode": "simulation_only",
-        "auto_trading": False,
-        "okx_market_data": "not_connected",
-        "line_notification": "not_configured",
-        "timeframes": ["1H", "4H", "1D", "1W"],
-        "time": current_time()
-    })
+        try:
+            response = self.session.get(
+                url,
+                params=params or {},
+                timeout=self.timeout
+            )
 
+            response.raise_for_status()
+            result = response.json()
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+        except requests.RequestException as exc:
+            raise OKXAPIError(
+                f"OKX network error: {exc}"
+            ) from exc
+
+        except ValueError as exc:
+            raise OKXAPIError(
+                "OKX returned invalid JSON"
+            ) from exc
+
+        if result.get("code") != "0":
+            raise OKXAPIError(
+                f"OKX API error: {result.get('code')} "
+                f"{result.get('msg')}"
+            )
+
+        return result.get("data", [])
+
+    def get_swap_instruments(self):
+        data = self._request(
+            "/api/v5/public/instruments",
+            {"instType": "SWAP"}
+        )
+
+        return [
+            item for item in data
+            if item.get("settleCcy") == "USDT"
+            and item.get("state") == "live"
+            and item.get("instId", "").endswith("-USDT-SWAP")
+        ]
+
+    def get_tickers(self):
+        return self._request(
+            "/api/v5/market/tickers",
+            {"instType": "SWAP"}
+        )
+
+    def get_ticker(self, inst_id):
+        data = self._request(
+            "/api/v5/market/ticker",
+            {"instId": inst_id}
+        )
+
+        if not data:
+            raise OKXAPIError(
+                f"No ticker data for {inst_id}"
+            )
+
+        return data[0]
+
+    def get_candles(
+        self,
+        inst_id,
+        bar="1H",
+        limit=100,
+        confirmed_only=True
+    ):
+        allowed_bars = {"1H", "4H", "1D", "1W"}
+
+        if bar not in allowed_bars:
+            raise ValueError(
+                f"Unsupported timeframe: {bar}"
+            )
+
+        if not isinstance(limit, int) or not 1 <= limit <= 300:
+            raise ValueError(
+                "limit must be between 1 and 300"
+            )
+
+        data = self._request(
+            "/api/v5/market/candles",
+            {
+                "instId": inst_id,
+                "bar": bar,
+                "limit": str(limit)
+            }
+        )
+
+        candles = []
+
+        for item in data:
+            if len(item) < 9:
+                continue
+
+            confirm = str(item[8])
+
+            if confirmed_only and confirm != "1":
+                continue
+
+            try:
+                timestamp = int(item[0])
+
+                candle = {
+                    "timestamp": timestamp,
+                    "datetime": datetime.fromtimestamp(
+                        timestamp / 1000,
+                        tz=timezone.utc
+                    ).isoformat(),
+                    "open": float(item[1]),
+                    "high": float(item[2]),
+                    "low": float(item[3]),
+                    "close": float(item[4]),
+                    "volume": float(item[5]),
+                    "volume_currency": float(item[6]),
+                    "volume_quote": float(item[7]),
+                    "confirm": confirm
+                }
+
+                candles.append(candle)
+
+            except (ValueError, TypeError):
+                continue
+
+        candles.sort(
+            key=lambda item: item["timestamp"]
+        )
+
+        return candles
