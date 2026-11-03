@@ -11,7 +11,7 @@ class FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise Exception("HTTP error")
+            raise RuntimeError("HTTP error")
 
     def json(self):
         return self.data
@@ -28,14 +28,25 @@ class FakeSession:
 
 def make_client(data):
     client = OKXClient()
-    client.session = FakeSession(data)
+
+    fake_response = FakeResponse(data)
+
+    fake_session = FakeSession(fake_response)
+
+    client.session = fake_session
+
     return client
 
 
 def test_get_ticker():
     client = make_client({
         "code": "0",
-        "data": [{"instId": "BTC-USDT-SWAP", "last": "95000"}]
+        "data": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "last": "95000"
+            }
+        ]
     })
 
     result = client.get_ticker("BTC-USDT-SWAP")
@@ -92,25 +103,13 @@ def test_get_candles_confirmed_only():
         "data": [
             [
                 "1791000000000",
-                "100",
-                "110",
-                "90",
-                "105",
-                "1000",
-                "1000",
-                "100000",
-                "1"
+                "100", "110", "90", "105",
+                "1000", "1000", "100000", "1"
             ],
             [
                 "1791003600000",
-                "105",
-                "115",
-                "100",
-                "110",
-                "1200",
-                "1200",
-                "130000",
-                "0"
+                "105", "115", "100", "110",
+                "1200", "1200", "130000", "0"
             ]
         ]
     })
@@ -133,25 +132,13 @@ def test_get_candles_include_unconfirmed():
         "data": [
             [
                 "1791000000000",
-                "100",
-                "110",
-                "90",
-                "105",
-                "1000",
-                "1000",
-                "100000",
-                "1"
+                "100", "110", "90", "105",
+                "1000", "1000", "100000", "1"
             ],
             [
                 "1791003600000",
-                "105",
-                "115",
-                "100",
-                "110",
-                "1200",
-                "1200",
-                "130000",
-                "0"
+                "105", "115", "100", "110",
+                "1200", "1200", "130000", "0"
             ]
         ]
     })
