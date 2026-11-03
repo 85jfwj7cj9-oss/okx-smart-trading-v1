@@ -1,157 +1,175 @@
 
-import os
-from datetime import datetime, timezone
+import pytest
 
-import requests
-
-
-class OKXAPIError(Exception):
-    """OKX API request or response error."""
-    pass
+from okx_client import OKXClient, OKXAPIError
 
 
-class OKXClient:
-    def __init__(self):
-        self.base_url = os.getenv(
-            "OKX_BASE_URL",
-            "https://www.okx.com"
-        ).rstrip("/")
+class FakeResponse:
+    def __init__(self, data, status_code=200):
+        self.data = data
+        self.status_code = status_code
 
-        self.timeout = 15
-        self.session = requests.Session()
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception("HTTP error")
 
-        self.session.headers.update({
-            "User-Agent": "OKX-SMART-TRADING-V1.0"
-        })
+    def json(self):
+        return self.data
 
-    def _request(self, endpoint, params=None):
-        url = self.base_url + endpoint
 
-        try:
-            response = self.session.get(
-                url,
-                params=params or {},
-                timeout=self.timeout
-            )
+class FakeSession:
+    def __init__(self, response):
+        self.response = response
+        self.headers = {}
 
-            response.raise_for_status()
-            result = response.json()
+    def get(self, url, params=None, timeout=None):
+        return self.response
 
-        except requests.RequestException as exc:
-            raise OKXAPIError(
-                f"OKX network error: {exc}"
-            ) from exc
 
-        except ValueError as exc:
-            raise OKXAPIError(
-                "OKX returned invalid JSON"
-            ) from exc
+def make_client(data):
+    client = OKXClient()
+    response = FakeResponse(data)
+    client.session = FakeSession(response)
+    return client
 
-        if result.get("code") != "0":
-            raise OKXAPIError(
-                f"OKX API error: {result.get('code')} "
-                f"{result.get('msg')}"
-            )
 
-        return result.get("data", [])
-
-    def get_swap_instruments(self):
-        data = self._request(
-            "/api/v5/public/instruments",
-            {"instType": "SWAP"}
-        )
-
-        return [
-            item for item in data
-            if item.get("settleCcy") == "USDT"
-            and item.get("state") == "live"
-            and item.get("instId", "").endswith("-USDT-SWAP")
+def test_get_ticker():
+    client = make_client({
+        "code": "0",
+        "data": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "last": "95000"
+            }
         ]
+    })
 
-    def get_tickers(self):
-        return self._request(
-            "/api/v5/market/tickers",
-            {"instType": "SWAP"}
+    result = client.get_ticker("BTC-USDT-SWAP")
+
+    assert result["instId"] == "BTC-USDT-SWAP"
+    assert float(result["last"]) == 95000
+
+
+def test_get_ticker_empty():
+    client = make_client({
+        "code": "0",
+        "data": []
+    })
+
+    with pytest.raises(OKXAPIError):
+        client.get_ticker("BTC-USDT-SWAP")
+
+
+def test_invalid_timeframe():
+    client = OKXClient()
+
+    with pytest.raises(ValueError):
+        client.get_candles(
+            "BTC-USDT-SWAP",
+            bar="2H"
         )
 
-    def get_ticker(self, inst_id):
-        data = self._request(
-            "/api/v5/market/ticker",
-            {"instId": inst_id}
+
+def test_invalid_candle_limit():
+    client = OKXClient()
+
+    with pytest.raises(ValueError):
+        client.get_candles(
+            "BTC-USDT-SWAP",
+            bar="1H",
+            limit=500
         )
 
-        if not data:
-            raise OKXAPIError(
-                f"No ticker data for {inst_id}"
-            )
 
-        return data[0]
+def test_okx_api_error():
+    client = make_client({
+        "code": "50000",
+        "msg": "Test error",
+        "data": []
+    })
 
-    def get_candles(
-        self,
-        inst_id,
+    with pytest.raises(OKXAPIError):
+        client.get_tickers()
+
+
+def test_get_candles_confirmed_only():
+    client = make_client({
+        "code": "0",
+        "data": [
+            [
+                "1791000000000",
+                "100",
+                "110",
+                "90",
+                "105",
+                "1000",
+                "1000",
+                "100000",
+                "1"
+            ],
+            [
+                "1791003600000",
+                "105",
+                "115",
+                "100",
+                "110",
+                "1200",
+                "1200",
+                "130000",
+                "0"
+            ]
+        ]
+    })
+
+    candles = client.get_candles(
+        "BTC-USDT-SWAP",
         bar="1H",
         limit=100,
         confirmed_only=True
-    ):
-        allowed_bars = {"1H", "4H", "1D", "1W"}
+    )
 
-        if bar not in allowed_bars:
-            raise ValueError(
-                f"Unsupported timeframe: {bar}"
-            )
+    assert len(candles) == 1
+    assert candles[0]["confirm"] == "1"
+    assert candles[0]["close"] == 105.0
 
-        if not isinstance(limit, int) or not 1 <= limit <= 300:
-            raise ValueError(
-                "limit must be between 1 and 300"
-            )
 
-        data = self._request(
-            "/api/v5/market/candles",
-            {
-                "instId": inst_id,
-                "bar": bar,
-                "limit": str(limit)
-            }
-        )
+def test_get_candles_include_unconfirmed():
+    client = make_client({
+        "code": "0",
+        "data": [
+            [
+                "1791000000000",
+                "100",
+                "110",
+                "90",
+                "105",
+                "1000",
+                "1000",
+                "100000",
+                "1"
+            ],
+            [
+                "1791003600000",
+                "105",
+                "115",
+                "100",
+                "110",
+                "1200",
+                "1200",
+                "130000",
+                "0"
+            ]
+        ]
+    })
 
-        candles = []
+    candles = client.get_candles(
+        "BTC-USDT-SWAP",
+        bar="1H",
+        limit=100,
+        confirmed_only=False
+    )
 
-        for item in data:
-            if len(item) < 9:
-                continue
+    assert len(candles) == 2
 
-            confirm = str(item[8])
 
-            if confirmed_only and confirm != "1":
-                continue
-
-            try:
-                timestamp = int(item[0])
-
-                candle = {
-                    "timestamp": timestamp,
-                    "datetime": datetime.fromtimestamp(
-                        timestamp / 1000,
-                        tz=timezone.utc
-                    ).isoformat(),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5]),
-                    "volume_currency": float(item[6]),
-                    "volume_quote": float(item[7]),
-                    "confirm": confirm
-                }
-
-                candles.append(candle)
-
-            except (ValueError, TypeError):
-                continue
-
-        candles.sort(
-            key=lambda item: item["timestamp"]
-        )
-
-        return candles
+                
