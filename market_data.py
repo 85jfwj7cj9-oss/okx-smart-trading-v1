@@ -36,40 +36,48 @@ class MarketData:
 
             try:
                 timestamp = int(item["timestamp"])
-
-                open_price = float(item["open"])
-                high_price = float(item["high"])
-                low_price = float(item["low"])
                 close_price = float(item["close"])
 
-                values = [
-                    open_price,
-                    high_price,
-                    low_price,
-                    close_price
-                ]
-
-                if not all(math.isfinite(v) for v in values):
+                if not math.isfinite(close_price):
                     continue
 
-                if min(values) <= 0:
+                if close_price <= 0:
                     continue
 
-                if high_price < max(open_price, close_price):
-                    continue
+                # 完整 OHLC 資料才執行完整價格驗證。
+                # 測試或簡化資料允許只有 timestamp、close。
+                ohlc_keys = ("open", "high", "low", "close")
 
-                if low_price > min(open_price, close_price):
-                    continue
+                if all(key in item for key in ohlc_keys):
+                    open_price = float(item["open"])
+                    high_price = float(item["high"])
+                    low_price = float(item["low"])
 
-                if low_price > high_price:
-                    continue
+                    values = [
+                        open_price,
+                        high_price,
+                        low_price,
+                        close_price
+                    ]
+
+                    if not all(math.isfinite(v) for v in values):
+                        continue
+
+                    if min(values) <= 0:
+                        continue
+
+                    if high_price < max(open_price, close_price):
+                        continue
+
+                    if low_price > min(open_price, close_price):
+                        continue
+
+                    if low_price > high_price:
+                        continue
 
                 result.append({
                     **item,
                     "timestamp": timestamp,
-                    "open": open_price,
-                    "high": high_price,
-                    "low": low_price,
                     "close": close_price
                 })
 
@@ -107,7 +115,8 @@ class MarketData:
         tickers = self.client.get_tickers()
 
         allowed = {
-            item["instId"] for item in instruments
+            item["instId"]
+            for item in instruments
             if item.get("instId")
         }
 
@@ -143,8 +152,6 @@ class MarketData:
                     last / open_24h - 1
                 ) * 100
 
-            # 若交易所回傳報價幣成交額欄位，優先採用。
-            # 否則以基礎幣成交量 × 最新價格估算。
             quote_volume = self._valid_number(
                 ticker.get("volCcyQuote24h")
             )
@@ -227,6 +234,7 @@ class MarketData:
         asset_candles = MarketData._valid_candles(
             asset_candles
         )
+
         btc_candles = MarketData._valid_candles(
             btc_candles
         )
@@ -246,8 +254,8 @@ class MarketData:
         )
 
         return [
-            (asset_map[timestamp], btc_map[timestamp])
-            for timestamp in common
+            (asset_map[t], btc_map[t])
+            for t in common
         ]
 
     def calculate_relative_strength(
@@ -313,18 +321,20 @@ class MarketData:
             return {}
 
         if not isinstance(timeframes, (list, tuple)):
-            raise ValueError("timeframes must be a list or tuple")
+            raise ValueError(
+                "timeframes must be a list or tuple"
+            )
 
         if (
             isinstance(limit, bool)
             or not isinstance(limit, int)
             or not 1 <= limit <= 300
         ):
-            raise ValueError("limit must be between 1 and 300")
+            raise ValueError(
+                "limit must be between 1 and 300"
+            )
 
         result = {}
-
-        # 同一輪計算中，每個週期只抓一次 BTC K 線。
         btc_cache = {}
 
         for timeframe in timeframes:
@@ -341,11 +351,13 @@ class MarketData:
             )
 
             if timeframe not in btc_cache:
-                btc_cache[timeframe] = self.client.get_candles(
-                    self.btc_symbol,
-                    bar=timeframe,
-                    limit=limit,
-                    confirmed_only=True
+                btc_cache[timeframe] = (
+                    self.client.get_candles(
+                        self.btc_symbol,
+                        bar=timeframe,
+                        limit=limit,
+                        confirmed_only=True
+                    )
                 )
 
             result[timeframe] = (
