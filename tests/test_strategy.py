@@ -137,6 +137,7 @@ def test_long_breakout_confirmation(engine):
     df = make_features(
         close=106,
         high=107,
+        low=103,
         ema7=105.8,
         ema20=104,
         ema50=100,
@@ -189,6 +190,7 @@ def test_short_early_entry(engine):
 def test_short_breakdown_confirmation(engine):
     df = make_features(
         close=92,
+        high=95,
         low=91,
         ema7=94,
         ema20=96,
@@ -259,6 +261,7 @@ def test_short_signal_can_be_disabled(engine, monkeypatch):
     monkeypatch.setattr(Config, "ENABLE_SHORT", False)
     df = make_features(
         close=99,
+        high=102,
         low=98,
         ema7=99.5,
         ema20=100,
