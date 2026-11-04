@@ -1,43 +1,47 @@
-
+import math
 import pandas as pd
 
 from config import Config
 
+try:
+    from fibonacci import FibonacciEngine
+except Exception:
+    FibonacciEngine = None
+
 
 class StrategyEngine:
-    """OKX SMART TRADING V1.0 多空策略訊號引擎。"""
+    """OKX SMART TRADING V1.0 多空四策略訊號引擎。"""
 
-    def __init__(self, min_score=None):
+    TIMEFRAME_WEIGHTS = {"1H": 0.65, "4H": 0.35}
+
+    def __init__(self, min_score=None, breakout_lookback=20):
         self.min_score = (
-            Config.MIN_SIGNAL_SCORE
+            getattr(Config, "MIN_SIGNAL_SCORE", 70)
             if min_score is None else min_score
         )
+        self.breakout_lookback = max(2, int(breakout_lookback))
 
     @staticmethod
     def _number(value, default=None):
         try:
             result = float(value)
-            if pd.isna(result):
+            if not math.isfinite(result):
                 return default
             return result
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
     @staticmethod
     def _latest(df, column, default=None):
-        if df is None or column not in df.columns or df.empty:
+        if not isinstance(df, pd.DataFrame) or df.empty or column not in df:
             return default
-        return StrategyEngine._number(
-            df[column].iloc[-1], default
-        )
+        return StrategyEngine._number(df[column].iloc[-1], default)
 
     @staticmethod
     def _previous(df, column, default=None):
-        if df is None or column not in df.columns or len(df) < 2:
+        if not isinstance(df, pd.DataFrame) or len(df) < 2 or column not in df:
             return default
-        return StrategyEngine._number(
-            df[column].iloc[-2], default
-        )
+        return StrategyEngine._number(df[column].iloc[-2], default)
 
     @staticmethod
     def _has_columns(df, columns):
@@ -56,61 +60,74 @@ class StrategyEngine:
             "volume_ma_20"
         ]
 
-        if not self._has_columns(df, required):
+        if not self._has_columns(df, required) or len(df) < 2:
             return False
 
-        if len(df) < 2:
-            return False
+        for column in required:
+            values = pd.to_numeric(df[column], errors="coerce")
+
+            if values.iloc[-2:].isna().any():
+                return False
+
+            if not all(math.isfinite(float(v)) for v in values.iloc[-2:]):
+                return False
 
         close = self._latest(df, "close")
-        if close is None or close <= 0:
+        high = self._latest(df, "high")
+        low = self._latest(df, "low")
+        volume = self._latest(df, "volume")
+
+        if close is None or high is None or low is None or volume is None:
+            return False
+
+        if close <= 0 or high <= 0 or low <= 0 or volume < 0:
+            return False
+
+        if high < low or close > high or close < low:
             return False
 
         return True
 
     def _common_features(self, df):
-        close = self._latest(df, "close")
-        previous_close = self._previous(df, "close")
-
-        ema7 = self._latest(df, "ema_7")
-        ema20 = self._latest(df, "ema_20")
-        ema50 = self._latest(df, "ema_50")
-
-        rsi = self._latest(df, "rsi_14")
-        macd = self._latest(df, "macd")
-        macd_signal = self._latest(df, "macd_signal")
-        macd_hist = self._latest(df, "macd_hist")
-        previous_hist = self._previous(df, "macd_hist")
-
-        adx = self._latest(df, "adx")
-        plus_di = self._latest(df, "plus_di")
-        minus_di = self._latest(df, "minus_di")
-
-        volume = self._latest(df, "volume")
-        volume_ma = self._latest(df, "volume_ma_20")
-
-        high = self._latest(df, "high")
-        low = self._latest(df, "low")
-
-        return {
-            "close": close,
-            "previous_close": previous_close,
-            "ema7": ema7,
-            "ema20": ema20,
-            "ema50": ema50,
-            "rsi": rsi,
-            "macd": macd,
-            "macd_signal": macd_signal,
-            "macd_hist": macd_hist,
-            "previous_hist": previous_hist,
-            "adx": adx,
-            "plus_di": plus_di,
-            "minus_di": minus_di,
-            "volume": volume,
-            "volume_ma": volume_ma,
-            "high": high,
-            "low": low
+        values = {
+            "close": self._latest(df, "close"),
+            "previous_close": self._previous(df, "close"),
+            "ema7": self._latest(df, "ema_7"),
+            "ema20": self._latest(df, "ema_20"),
+            "ema50": self._latest(df, "ema_50"),
+            "ema100": self._latest(df, "ema_100"),
+            "ema200": self._latest(df, "ema_200"),
+            "rsi": self._latest(df, "rsi_14"),
+            "macd": self._latest(df, "macd"),
+            "macd_signal": self._latest(df, "macd_signal"),
+            "macd_hist": self._latest(df, "macd_hist"),
+            "previous_hist": self._previous(df, "macd_hist"),
+            "adx": self._latest(df, "adx"),
+            "plus_di": self._latest(df, "plus_di"),
+            "minus_di": self._latest(df, "minus_di"),
+            "volume": self._latest(df, "volume"),
+            "volume_ma": self._latest(df, "volume_ma_20"),
+            "high": self._latest(df, "high"),
+            "low": self._latest(df, "low"),
+            "atr": self._latest(
+                df, "atr_14", self._latest(df, "atr")
+            ),
+            "supertrend_direction": self._latest(
+                df, "supertrend_direction"
+            ),
+            "obv": self._latest(df, "obv"),
+            "bb_upper": self._latest(df, "bb_upper"),
+            "bb_middle": self._latest(df, "bb_middle"),
+            "bb_lower": self._latest(df, "bb_lower"),
+            "bb_bandwidth": self._latest(df, "bb_bandwidth"),
         }
+
+        values["previous_obv"] = self._previous(df, "obv")
+        values["previous_bb_bandwidth"] = self._previous(
+            df, "bb_bandwidth"
+        )
+
+        return values
 
     @staticmethod
     def _valid_features(features):
@@ -120,59 +137,71 @@ class StrategyEngine:
             "adx", "plus_di", "minus_di",
             "volume", "volume_ma", "high", "low"
         ]
+
         return all(features.get(key) is not None for key in required)
+
+    @staticmethod
+    def _relative_strength_adjustment(relative_strength, direction):
+        if relative_strength is None:
+            return 0, "BTC 相對強弱資料缺失"
+
+        rs = StrategyEngine._number(relative_strength)
+
+        if rs is None:
+            return 0, "BTC 相對強弱資料無效"
+
+        if direction == "LONG":
+            if rs > 0:
+                return 10, "相對 BTC 強勢"
+            if rs < -2:
+                return -5, "相對 BTC 弱勢，扣分"
+
+        else:
+            if rs < 0:
+                return 10, "相對 BTC 弱勢"
+            if rs > 2:
+                return -5, "相對 BTC 強勢，扣分"
+
+        return 0, "相對 BTC 表現中性"
 
     def _score_long(self, f, relative_strength=None):
         score = 0
         reasons = []
 
-        if f["close"] > f["ema20"]:
-            score += 10
-            reasons.append("價格站上 EMA20")
+        checks = [
+            (f["close"] > f["ema20"], 10, "價格站上 EMA20"),
+            (f["ema7"] > f["ema20"], 10, "EMA7 高於 EMA20"),
+            (f["ema20"] > f["ema50"], 10, "EMA20 高於 EMA50"),
+            (45 <= f["rsi"] <= 70, 10, "RSI 多頭區間"),
+            (f["macd"] > f["macd_signal"], 10, "MACD 多頭排列"),
+            (f["macd_hist"] > 0, 10, "MACD 柱體為正"),
+            (
+                f["macd_hist"] > f["previous_hist"],
+                5,
+                "MACD 動能增強"
+            ),
+            (f["plus_di"] > f["minus_di"], 10, "DMI 多方占優"),
+            (f["adx"] >= 20, 10, "ADX 趨勢強度足夠"),
+            (
+                f["volume_ma"] > 0 and f["volume"] > f["volume_ma"],
+                5,
+                "成交量高於均量"
+            ),
+        ]
 
-        if f["ema7"] > f["ema20"]:
-            score += 10
-            reasons.append("EMA7 高於 EMA20")
+        for passed, points, reason in checks:
+            if passed:
+                score += points
+                reasons.append(reason)
 
-        if f["ema20"] > f["ema50"]:
-            score += 10
-            reasons.append("EMA20 高於 EMA50")
+        adjustment, rs_reason = self._relative_strength_adjustment(
+            relative_strength, "LONG"
+        )
 
-        if 45 <= f["rsi"] <= 70:
-            score += 10
-            reasons.append("RSI 多頭區間")
-
-        if f["macd"] > f["macd_signal"]:
-            score += 10
-            reasons.append("MACD 多頭排列")
-
-        if f["macd_hist"] > 0:
-            score += 10
-            reasons.append("MACD 柱體為正")
-
-        if f["macd_hist"] > f["previous_hist"]:
-            score += 5
-            reasons.append("MACD 動能增強")
-
-        if f["plus_di"] > f["minus_di"]:
-            score += 10
-            reasons.append("DMI 多方占優")
-
-        if f["adx"] >= 20:
-            score += 10
-            reasons.append("ADX 趨勢強度足夠")
-
-        if f["volume_ma"] > 0 and f["volume"] > f["volume_ma"]:
-            score += 5
-            reasons.append("成交量高於均量")
+        score += adjustment
 
         if relative_strength is not None:
-            if relative_strength > 0:
-                score += 10
-                reasons.append("強於 BTC")
-            elif relative_strength < -2:
-                score -= 5
-                reasons.append("弱於 BTC")
+            reasons.append(rs_reason)
 
         return max(0, min(100, score)), reasons
 
@@ -180,100 +209,305 @@ class StrategyEngine:
         score = 0
         reasons = []
 
-        if f["close"] < f["ema20"]:
-            score += 10
-            reasons.append("價格跌破 EMA20")
+        checks = [
+            (f["close"] < f["ema20"], 10, "價格跌破 EMA20"),
+            (f["ema7"] < f["ema20"], 10, "EMA7 低於 EMA20"),
+            (f["ema20"] < f["ema50"], 10, "EMA20 低於 EMA50"),
+            (30 <= f["rsi"] <= 55, 10, "RSI 空頭區間"),
+            (f["macd"] < f["macd_signal"], 10, "MACD 空頭排列"),
+            (f["macd_hist"] < 0, 10, "MACD 柱體為負"),
+            (
+                f["macd_hist"] < f["previous_hist"],
+                5,
+                "MACD 空頭動能增強"
+            ),
+            (f["minus_di"] > f["plus_di"], 10, "DMI 空方占優"),
+            (f["adx"] >= 20, 10, "ADX 趨勢強度足夠"),
+            (
+                f["volume_ma"] > 0 and f["volume"] > f["volume_ma"],
+                5,
+                "成交量高於均量"
+            ),
+        ]
 
-        if f["ema7"] < f["ema20"]:
-            score += 10
-            reasons.append("EMA7 低於 EMA20")
+        for passed, points, reason in checks:
+            if passed:
+                score += points
+                reasons.append(reason)
 
-        if f["ema20"] < f["ema50"]:
-            score += 10
-            reasons.append("EMA20 低於 EMA50")
+        adjustment, rs_reason = self._relative_strength_adjustment(
+            relative_strength, "SHORT"
+        )
 
-        if 30 <= f["rsi"] <= 55:
-            score += 10
-            reasons.append("RSI 空頭區間")
-
-        if f["macd"] < f["macd_signal"]:
-            score += 10
-            reasons.append("MACD 空頭排列")
-
-        if f["macd_hist"] < 0:
-            score += 10
-            reasons.append("MACD 柱體為負")
-
-        if f["macd_hist"] < f["previous_hist"]:
-            score += 5
-            reasons.append("MACD 空頭動能增強")
-
-        if f["minus_di"] > f["plus_di"]:
-            score += 10
-            reasons.append("DMI 空方占優")
-
-        if f["adx"] >= 20:
-            score += 10
-            reasons.append("ADX 趨勢強度足夠")
-
-        if f["volume_ma"] > 0 and f["volume"] > f["volume_ma"]:
-            score += 5
-            reasons.append("成交量高於均量")
+        score += adjustment
 
         if relative_strength is not None:
-            if relative_strength < 0:
-                score += 10
-                reasons.append("弱於 BTC")
-            elif relative_strength > 2:
-                score -= 5
-                reasons.append("強於 BTC")
+            reasons.append(rs_reason)
 
         return max(0, min(100, score)), reasons
 
+    @staticmethod
+    def _ema_convergence(f):
+        values = [f.get("ema7"), f.get("ema20"), f.get("ema50")]
+
+        if any(v is None or v <= 0 for v in values):
+            return None
+
+        return (max(values) - min(values)) / f["close"] * 100
+
     def _early_long(self, f):
+        convergence = self._ema_convergence(f)
+
         return (
             f["close"] > f["ema50"]
             and f["close"] <= f["ema20"] * 1.025
             and f["ema7"] <= f["ema20"] * 1.015
-            and f["rsi"] >= 40
-            and f["rsi"] <= 65
+            and 40 <= f["rsi"] <= 65
             and f["macd_hist"] > f["previous_hist"]
+            and (convergence is None or convergence <= 3.0)
         )
 
     def _breakout_long(self, f, df):
-        previous_high = self._previous(df, "high")
-        if previous_high is None:
+        lookback = min(self.breakout_lookback, len(df) - 1)
+
+        if lookback < 1:
             return False
 
+        prior_high = pd.to_numeric(
+            df["high"].iloc[-lookback-1:-1],
+            errors="coerce"
+        ).max()
+
+        if pd.isna(prior_high):
+            return False
+
+        volume_confirmed = (
+            f["volume_ma"] > 0
+            and f["volume"] > f["volume_ma"]
+        )
+
         return (
-            f["close"] > previous_high
+            f["close"] > float(prior_high)
             and f["close"] > f["ema20"]
             and f["ema7"] > f["ema20"]
             and f["macd_hist"] > 0
             and f["macd_hist"] > f["previous_hist"]
+            and (volume_confirmed or len(df) < 20)
         )
 
     def _early_short(self, f):
+        convergence = self._ema_convergence(f)
+
         return (
             f["close"] < f["ema50"]
             and f["close"] >= f["ema20"] * 0.975
             and f["ema7"] >= f["ema20"] * 0.985
-            and f["rsi"] >= 35
-            and f["rsi"] <= 60
+            and 35 <= f["rsi"] <= 60
             and f["macd_hist"] < f["previous_hist"]
+            and (convergence is None or convergence <= 3.0)
         )
 
     def _breakdown_short(self, f, df):
-        previous_low = self._previous(df, "low")
-        if previous_low is None:
+        lookback = min(self.breakout_lookback, len(df) - 1)
+
+        if lookback < 1:
             return False
 
+        prior_low = pd.to_numeric(
+            df["low"].iloc[-lookback-1:-1],
+            errors="coerce"
+        ).min()
+
+        if pd.isna(prior_low):
+            return False
+
+        volume_confirmed = (
+            f["volume_ma"] > 0
+            and f["volume"] > f["volume_ma"]
+        )
+
         return (
-            f["close"] < previous_low
+            f["close"] < float(prior_low)
             and f["close"] < f["ema20"]
             and f["ema7"] < f["ema20"]
             and f["macd_hist"] < 0
             and f["macd_hist"] < f["previous_hist"]
+            and (volume_confirmed or len(df) < 20)
+        )
+
+    @staticmethod
+    def _optional_confirmation(f, direction):
+        points = 0
+        reasons = []
+
+        st = f.get("supertrend_direction")
+
+        if st in (1, -1):
+            if (
+                direction == "LONG" and st == 1
+            ) or (
+                direction == "SHORT" and st == -1
+            ):
+                points += 5
+                reasons.append("Supertrend 方向確認")
+            else:
+                points -= 5
+                reasons.append("Supertrend 與訊號方向衝突")
+
+        obv = f.get("obv")
+        prev_obv = f.get("previous_obv")
+
+        if obv is not None and prev_obv is not None:
+            if (
+                direction == "LONG" and obv > prev_obv
+            ) or (
+                direction == "SHORT" and obv < prev_obv
+            ):
+                points += 3
+                reasons.append("OBV 方向配合")
+            else:
+                points -= 2
+                reasons.append("OBV 未配合訊號方向")
+
+        if (
+            f.get("bb_upper") is not None
+            and f.get("bb_lower") is not None
+            and f.get("bb_middle") is not None
+        ):
+            if f["bb_upper"] > f["bb_lower"]:
+                if (
+                    direction == "LONG"
+                    and f["close"] > f["bb_middle"]
+                ):
+                    points += 2
+                    reasons.append("布林中軌偏多")
+
+                elif (
+                    direction == "SHORT"
+                    and f["close"] < f["bb_middle"]
+                ):
+                    points += 2
+                    reasons.append("布林中軌偏空")
+
+        return points, reasons
+
+    def _fibonacci_context(self, df, direction):
+        if FibonacciEngine is None or len(df) < 10:
+            return None
+
+        try:
+            result = FibonacciEngine.analyze(
+                df,
+                left=3,
+                right=3
+            )
+
+            context = result.get(
+                "bullish" if direction == "LONG" else "bearish"
+            )
+
+            if not context:
+                return None
+
+            current = result["current_price"]
+            levels = context.get("retracement", {})
+
+            distances = [
+                (level, price, abs(current - price) / current * 100)
+                for level, price in levels.items()
+                if current > 0 and price > 0
+            ]
+
+            if not distances:
+                return None
+
+            level, price, distance = min(
+                distances,
+                key=lambda item: item[2]
+            )
+
+            if distance <= 1.5:
+                return {
+                    "level": level,
+                    "price": price,
+                    "distance_pct": distance
+                }
+
+        except (ValueError, TypeError, KeyError, IndexError):
+            return None
+
+        return None
+
+    def _strategy_score(
+        self,
+        base_score,
+        f,
+        direction,
+        strategy,
+        fib_context
+    ):
+        score = base_score
+        reasons = []
+
+        optional_points, optional_reasons = (
+            self._optional_confirmation(f, direction)
+        )
+
+        score += optional_points
+        reasons.extend(optional_reasons)
+
+        if strategy.endswith("-A"):
+            convergence = self._ema_convergence(f)
+
+            if convergence is not None and convergence <= 1.5:
+                score += 5
+                reasons.append("EMA20/50/7 高度收斂")
+
+            elif convergence is not None and convergence > 3:
+                score -= 5
+                reasons.append("均線未收斂，提前埋伏條件較弱")
+
+            if (
+                direction == "LONG"
+                and f["macd_hist"] > f["previous_hist"]
+            ):
+                score += 3
+                reasons.append("多方動能改善")
+
+            elif (
+                direction == "SHORT"
+                and f["macd_hist"] < f["previous_hist"]
+            ):
+                score += 3
+                reasons.append("空方動能改善")
+
+        else:
+            volume_ok = (
+                f["volume_ma"] > 0
+                and f["volume"] > f["volume_ma"]
+            )
+
+            if volume_ok:
+                score += 5
+                reasons.append("突破／跌破成交量確認")
+            else:
+                score -= 5
+                reasons.append("成交量未確認突破／跌破")
+
+        if fib_context:
+            score += 5
+            reasons.append(
+                f"接近 Fibonacci {fib_context['level']} "
+                f"（距離 {fib_context['distance_pct']:.2f}%）"
+            )
+
+        return max(0, min(100, round(score))), reasons
+
+    @staticmethod
+    def _weighted_score(score_1h, score_4h):
+        return round(
+            score_1h * StrategyEngine.TIMEFRAME_WEIGHTS["1H"]
+            + score_4h * StrategyEngine.TIMEFRAME_WEIGHTS["4H"]
         )
 
     def analyze(
@@ -284,85 +518,184 @@ class StrategyEngine:
         relative_strength_1h=None,
         relative_strength_4h=None
     ):
-        """分析單一幣種，回傳多空候選訊號。"""
-
         if not self._validate(df_1h):
-            return self._empty_result(inst_id, "1H資料不足或欄位不完整")
+            return self._empty_result(
+                inst_id,
+                "1H資料不足或欄位不完整"
+            )
 
         if not self._validate(df_4h):
-            return self._empty_result(inst_id, "4H資料不足或欄位不完整")
+            return self._empty_result(
+                inst_id,
+                "4H資料不足或欄位不完整"
+            )
 
         f1 = self._common_features(df_1h)
         f4 = self._common_features(df_4h)
 
-        if not self._valid_features(f1) or not self._valid_features(f4):
-            return self._empty_result(inst_id, "技術指標尚未形成")
+        if (
+            not self._valid_features(f1)
+            or not self._valid_features(f4)
+        ):
+            return self._empty_result(
+                inst_id,
+                "技術指標尚未形成"
+            )
 
-        long_score, long_reasons = self._score_long(
-            f1, relative_strength_1h
-        )
-        short_score, short_reasons = self._score_short(
-            f1, relative_strength_1h
-        )
-
-        long_4h_score, _ = self._score_long(
-            f4, relative_strength_4h
-        )
-        short_4h_score, _ = self._score_short(
-            f4, relative_strength_4h
+        long_1h, long_reasons = self._score_long(
+            f1,
+            relative_strength_1h
         )
 
-        long_score = round(long_score * 0.65 + long_4h_score * 0.35)
-        short_score = round(short_score * 0.65 + short_4h_score * 0.35)
+        short_1h, short_reasons = self._score_short(
+            f1,
+            relative_strength_1h
+        )
 
-        long_candidates = []
+        long_4h, long_4h_reasons = self._score_long(
+            f4,
+            relative_strength_4h
+        )
+
+        short_4h, short_4h_reasons = self._score_short(
+            f4,
+            relative_strength_4h
+        )
+
+        # 保留舊版總分欄位與 65/35 權重。
+        long_score = self._weighted_score(
+            long_1h,
+            long_4h
+        )
+
+        short_score = self._weighted_score(
+            short_1h,
+            short_4h
+        )
+
+        fib_long = self._fibonacci_context(
+            df_4h,
+            "LONG"
+        )
+
+        fib_short = self._fibonacci_context(
+            df_4h,
+            "SHORT"
+        )
+
+        long_a_score, long_a_extra = self._strategy_score(
+            long_score,
+            f1,
+            "LONG",
+            "LONG-A",
+            fib_long
+        )
+
+        long_b_score, long_b_extra = self._strategy_score(
+            long_score,
+            f1,
+            "LONG",
+            "LONG-B",
+            fib_long
+        )
+
+        short_a_score, short_a_extra = self._strategy_score(
+            short_score,
+            f1,
+            "SHORT",
+            "SHORT-A",
+            fib_short
+        )
+
+        short_b_score, short_b_extra = self._strategy_score(
+            short_score,
+            f1,
+            "SHORT",
+            "SHORT-B",
+            fib_short
+        )
+
+        candidates = []
 
         if self._early_long(f1):
-            long_candidates.append("LONG-A")
+            candidates.append((
+                "LONG-A",
+                "LONG",
+                long_a_score,
+                long_reasons + long_4h_reasons + long_a_extra,
+                fib_long
+            ))
 
         if self._breakout_long(f1, df_1h):
-            long_candidates.append("LONG-B")
-
-        short_candidates = []
+            candidates.append((
+                "LONG-B",
+                "LONG",
+                long_b_score,
+                long_reasons + long_4h_reasons + long_b_extra,
+                fib_long
+            ))
 
         if self._early_short(f1):
-            short_candidates.append("SHORT-A")
+            candidates.append((
+                "SHORT-A",
+                "SHORT",
+                short_a_score,
+                short_reasons + short_4h_reasons + short_a_extra,
+                fib_short
+            ))
 
         if self._breakdown_short(f1, df_1h):
-            short_candidates.append("SHORT-B")
+            candidates.append((
+                "SHORT-B",
+                "SHORT",
+                short_b_score,
+                short_reasons + short_4h_reasons + short_b_extra,
+                fib_short
+            ))
 
         signals = []
 
-        if Config.ENABLE_LONG and long_score >= self.min_score:
-            for signal_type in long_candidates:
-                signals.append({
-                    "symbol": inst_id,
-                    "signal": signal_type,
-                    "direction": "LONG",
-                    "score": long_score,
-                    "price": f1["close"],
-                    "reasons": long_reasons,
-                    "timeframes": ["1H", "4H"],
-                    "status": "simulation_only"
-                })
+        for signal_type, direction, score, reasons, fib in candidates:
+            enabled = (
+                getattr(Config, "ENABLE_LONG", True)
+                if direction == "LONG"
+                else getattr(Config, "ENABLE_SHORT", True)
+            )
 
-        if Config.ENABLE_SHORT and short_score >= self.min_score:
-            for signal_type in short_candidates:
-                signals.append({
-                    "symbol": inst_id,
-                    "signal": signal_type,
-                    "direction": "SHORT",
-                    "score": short_score,
-                    "price": f1["close"],
-                    "reasons": short_reasons,
-                    "timeframes": ["1H", "4H"],
-                    "status": "simulation_only"
-                })
+            if not enabled or score < self.min_score:
+                continue
+
+            invalidation = (
+                f1["low"]
+                if direction == "LONG"
+                else f1["high"]
+            )
+
+            signals.append({
+                "symbol": inst_id,
+                "signal": signal_type,
+                "direction": direction,
+                "score": score,
+                "price": f1["close"],
+                "reasons": list(dict.fromkeys(reasons)),
+                "timeframes": ["1H", "4H"],
+                "fibonacci": fib,
+                "invalidation_price": invalidation,
+                "status": "simulation_only"
+            })
+
+        strategy_scores = {
+            "LONG-A": long_a_score,
+            "LONG-B": long_b_score,
+            "SHORT-A": short_a_score,
+            "SHORT-B": short_b_score
+        }
 
         return {
             "symbol": inst_id,
             "long_score": long_score,
             "short_score": short_score,
+            "strategy_scores": strategy_scores,
             "signals": signals,
             "status": "simulation_only"
         }
@@ -373,6 +706,12 @@ class StrategyEngine:
             "symbol": inst_id,
             "long_score": 0,
             "short_score": 0,
+            "strategy_scores": {
+                "LONG-A": 0,
+                "LONG-B": 0,
+                "SHORT-A": 0,
+                "SHORT-B": 0
+            },
             "signals": [],
             "status": "insufficient_data",
             "reason": reason
