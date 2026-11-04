@@ -57,16 +57,14 @@ class Config:
 
     ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
-    # OKX
+    # OKX public market data
     OKX_BASE_URL = os.getenv(
         "OKX_BASE_URL",
         "https://www.okx.com"
     ).rstrip("/")
 
-    OKX_DEMO_MODE = get_bool(
-        "OKX_DEMO_MODE",
-        True
-    )
+    # Current version uses public market data only.
+    OKX_DEMO_MODE = True
 
     # Scanner
     SCAN_INTERVAL_SECONDS = get_int(
@@ -74,18 +72,14 @@ class Config:
     )
 
     TOP_N_SYMBOLS = get_int(
-        "TOP_N_SYMBOLS", 100, 1, 300
+        "TOP_N_SYMBOLS",
+        get_int("MAX_SCAN_SYMBOLS", 20, 1, 100),
+        1,
+        100
     )
 
-    TIMEFRAMES = tuple(
-        item.strip()
-        for item in os.getenv(
-            "TIMEFRAMES", "1H,4H,1D,1W"
-        ).split(",")
-        if item.strip()
-    )
-
-    ALLOWED_TIMEFRAMES = ("1H", "4H", "1D", "1W")
+    TIMEFRAMES = ("1H", "4H")
+    ALLOWED_TIMEFRAMES = ("1H", "4H")
 
     BTC_BENCHMARK = os.getenv(
         "BTC_BENCHMARK",
@@ -169,6 +163,12 @@ class Config:
 
         if cls.INITIAL_EQUITY_USDT <= 0:
             errors.append("Initial equity must be positive")
+
+        if not 1 <= cls.SIMULATED_LEVERAGE <= 20:
+            errors.append("Invalid simulated leverage")
+
+        if not 0 <= cls.MIN_SIGNAL_SCORE <= 100:
+            errors.append("Invalid minimum signal score")
 
         return errors
 
