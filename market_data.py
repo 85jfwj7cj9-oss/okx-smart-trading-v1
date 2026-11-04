@@ -1,4 +1,6 @@
 
+import math
+
 from okx_client import OKXClient
 from config import Config
 
@@ -8,79 +10,178 @@ class MarketData:
         self.client = client or OKXClient()
         self.btc_symbol = Config.BTC_BENCHMARK
 
+    @staticmethod
+    def _valid_number(value, default=None):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+
+        if not math.isfinite(number):
+            return default
+
+        return number
+
+    @staticmethod
+    def _valid_candles(candles):
+        """整理有效 K 線，依時間由舊到新排列。"""
+        if not isinstance(candles, list):
+            return []
+
+        result = []
+
+        for item in candles:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                timestamp = int(item["timestamp"])
+
+                open_price = float(item["open"])
+                high_price = float(item["high"])
+                low_price = float(item["low"])
+                close_price = float(item["close"])
+
+                values = [
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price
+                ]
+
+                if not all(math.isfinite(v) for v in values):
+                    continue
+
+                if min(values) <= 0:
+                    continue
+
+                if high_price < max(open_price, close_price):
+                    continue
+
+                if low_price > min(open_price, close_price):
+                    continue
+
+                if low_price > high_price:
+                    continue
+
+                result.append({
+                    **item,
+                    "timestamp": timestamp,
+                    "open": open_price,
+                    "high": high_price,
+                    "low": low_price,
+                    "close": close_price
+                })
+
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+
+        result.sort(key=lambda item: item["timestamp"])
+
+        # 相同時間戳只保留最後一筆。
+        unique = {}
+
+        for item in result:
+            unique[item["timestamp"]] = item
+
+        return list(unique.values())
+
     def get_usdt_swap_universe(self):
         """取得可交易的 USDT 永續合約。"""
         instruments = self.client.get_swap_instruments()
 
+        if not isinstance(instruments, list):
+            return []
+
         return [
             item for item in instruments
-            if item.get("instId", "").endswith("-USDT-SWAP")
+            if isinstance(item, dict)
+            and item.get("instId", "").endswith("-USDT-SWAP")
             and item.get("settleCcy") == "USDT"
             and item.get("state") == "live"
         ]
 
     def get_market_overview(self):
-        """整理行情，依估算 USDT 成交額排序。"""
+        """整理行情，依 USDT 成交額排序。"""
         instruments = self.get_usdt_swap_universe()
         tickers = self.client.get_tickers()
 
         allowed = {
             item["instId"] for item in instruments
+            if item.get("instId")
         }
 
         rows = []
 
         for ticker in tickers:
+            if not isinstance(ticker, dict):
+                continue
+
             inst_id = ticker.get("instId")
 
             if inst_id not in allowed:
                 continue
 
-            try:
-                last = float(ticker.get("last", 0))
-                open_24h = float(ticker.get("open24h", 0))
-                volume_base = float(
-                    ticker.get("volCcy24h", 0)
-                )
+            last = self._valid_number(ticker.get("last"))
+            open_24h = self._valid_number(
+                ticker.get("open24h"), 0
+            )
+            volume_base = self._valid_number(
+                ticker.get("volCcy24h"), 0
+            )
 
-                if last <= 0:
-                    continue
-
-                change_pct = None
-                if open_24h > 0:
-                    change_pct = (
-                        last / open_24h - 1
-                    ) * 100
-
-                # 暫用基礎幣數量 × 最新價格估算 USDT 成交額。
-                # 這是估算值，不是交易所提供的精確成交額。
-                turnover_estimated = volume_base * last
-
-                rows.append({
-                    "inst_id": inst_id,
-                    "last": last,
-                    "volume_base_24h": volume_base,
-                    "turnover_estimated_usdt_24h":
-                        turnover_estimated,
-                    "change_24h_pct": (
-                        round(change_pct, 4)
-                        if change_pct is not None
-                        else None
-                    ),
-                    "high_24h": float(
-                        ticker.get("high24h", 0)
-                    ),
-                    "low_24h": float(
-                        ticker.get("low24h", 0)
-                    ),
-                })
-
-            except (TypeError, ValueError):
+            if last is None or last <= 0:
                 continue
 
+            if volume_base < 0:
+                continue
+
+            change_pct = None
+
+            if open_24h is not None and open_24h > 0:
+                change_pct = (
+                    last / open_24h - 1
+                ) * 100
+
+            # 若交易所回傳報價幣成交額欄位，優先採用。
+            # 否則以基礎幣成交量 × 最新價格估算。
+            quote_volume = self._valid_number(
+                ticker.get("volCcyQuote24h")
+            )
+
+            if quote_volume is not None and quote_volume >= 0:
+                turnover = quote_volume
+                turnover_source = "exchange_quote_volume"
+            else:
+                turnover = volume_base * last
+                turnover_source = "estimated"
+
+            high_24h = self._valid_number(
+                ticker.get("high24h"), 0
+            )
+            low_24h = self._valid_number(
+                ticker.get("low24h"), 0
+            )
+
+            rows.append({
+                "inst_id": inst_id,
+                "last": last,
+                "volume_base_24h": volume_base,
+                "turnover_estimated_usdt_24h": turnover,
+                "turnover_source": turnover_source,
+                "change_24h_pct": (
+                    round(change_pct, 4)
+                    if change_pct is not None
+                    else None
+                ),
+                "high_24h": high_24h,
+                "low_24h": low_24h
+            })
+
         rows.sort(
-            key=lambda row:
-                row["turnover_estimated_usdt_24h"],
+            key=lambda row: row[
+                "turnover_estimated_usdt_24h"
+            ],
             reverse=True
         )
 
@@ -90,15 +191,26 @@ class MarketData:
         if limit is None:
             limit = Config.TOP_N_SYMBOLS
 
-        if limit <= 0:
-            raise ValueError("limit must be positive")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit <= 0
+        ):
+            raise ValueError("limit must be a positive integer")
 
         return self.get_market_overview()[:limit]
 
     @staticmethod
     def calculate_return(candles, lookback=20):
         """計算已收盤 K 線區間報酬率。"""
-        if lookback < 1 or len(candles) <= lookback:
+        candles = MarketData._valid_candles(candles)
+
+        if (
+            isinstance(lookback, bool)
+            or not isinstance(lookback, int)
+            or lookback < 1
+            or len(candles) <= lookback
+        ):
             return None
 
         start_price = candles[-lookback - 1]["close"]
@@ -112,6 +224,13 @@ class MarketData:
     @staticmethod
     def align_candles(asset_candles, btc_candles):
         """只比較相同時間戳的 K 線。"""
+        asset_candles = MarketData._valid_candles(
+            asset_candles
+        )
+        btc_candles = MarketData._valid_candles(
+            btc_candles
+        )
+
         asset_map = {
             item["timestamp"]: item
             for item in asset_candles
@@ -127,8 +246,8 @@ class MarketData:
         )
 
         return [
-            (asset_map[t], btc_map[t])
-            for t in common
+            (asset_map[timestamp], btc_map[timestamp])
+            for timestamp in common
         ]
 
     def calculate_relative_strength(
@@ -143,7 +262,12 @@ class MarketData:
             btc_candles
         )
 
-        if lookback < 1 or len(aligned) <= lookback:
+        if (
+            isinstance(lookback, bool)
+            or not isinstance(lookback, int)
+            or lookback < 1
+            or len(aligned) <= lookback
+        ):
             return None
 
         asset_start = aligned[-lookback - 1][0]["close"]
@@ -188,9 +312,27 @@ class MarketData:
         if inst_id == self.btc_symbol:
             return {}
 
+        if not isinstance(timeframes, (list, tuple)):
+            raise ValueError("timeframes must be a list or tuple")
+
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 300
+        ):
+            raise ValueError("limit must be between 1 and 300")
+
         result = {}
 
+        # 同一輪計算中，每個週期只抓一次 BTC K 線。
+        btc_cache = {}
+
         for timeframe in timeframes:
+            if timeframe not in ("1H", "4H"):
+                raise ValueError(
+                    f"Unsupported timeframe: {timeframe}"
+                )
+
             asset_candles = self.client.get_candles(
                 inst_id,
                 bar=timeframe,
@@ -198,17 +340,18 @@ class MarketData:
                 confirmed_only=True
             )
 
-            btc_candles = self.client.get_candles(
-                self.btc_symbol,
-                bar=timeframe,
-                limit=limit,
-                confirmed_only=True
-            )
+            if timeframe not in btc_cache:
+                btc_cache[timeframe] = self.client.get_candles(
+                    self.btc_symbol,
+                    bar=timeframe,
+                    limit=limit,
+                    confirmed_only=True
+                )
 
             result[timeframe] = (
                 self.calculate_relative_strength(
                     asset_candles,
-                    btc_candles,
+                    btc_cache[timeframe],
                     lookback=20
                 )
             )
@@ -220,13 +363,20 @@ class MarketData:
         rows = self.get_top_symbols()
         btc = self.client.get_ticker(self.btc_symbol)
 
+        btc_last = self._valid_number(
+            btc.get("last")
+        )
+
+        if btc_last is None or btc_last <= 0:
+            raise ValueError("Invalid BTC ticker price")
+
         return {
             "symbol_count": len(rows),
             "btc": {
                 "inst_id": self.btc_symbol,
-                "last": float(btc["last"])
+                "last": btc_last
             },
             "top_symbols": rows,
             "turnover_note":
-                "24h USDT turnover is estimated, not exact"
+                "Turnover uses exchange quote volume when available; otherwise estimated"
         }
