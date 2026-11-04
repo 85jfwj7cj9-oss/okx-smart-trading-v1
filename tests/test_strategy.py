@@ -77,7 +77,6 @@ def test_invalid_1h_data(engine):
         pd.DataFrame(),
         make_features()
     )
-
     assert result["status"] == "insufficient_data"
     assert result["signals"] == []
 
@@ -88,32 +87,27 @@ def test_invalid_4h_data(engine):
         make_features(),
         pd.DataFrame()
     )
-
     assert result["status"] == "insufficient_data"
     assert result["signals"] == []
 
 
 def test_missing_indicator_column(engine):
     df = make_features().drop(columns=["ema_20"])
-
     result = engine.analyze(
         "ETH-USDT-SWAP",
         df,
         make_features()
     )
-
     assert result["status"] == "insufficient_data"
 
 
 def test_invalid_close_price(engine):
     df = make_features(close=0)
-
     result = engine.analyze(
         "ETH-USDT-SWAP",
         df,
         make_features()
     )
-
     assert result["status"] == "insufficient_data"
 
 
@@ -128,7 +122,6 @@ def test_long_early_entry(engine):
         previous_hist=0.1,
         previous_high=110
     )
-
     result = engine.analyze(
         "ETH-USDT-SWAP",
         df,
@@ -136,12 +129,7 @@ def test_long_early_entry(engine):
         relative_strength_1h=2,
         relative_strength_4h=1
     )
-
-    signals = [
-        item["signal"]
-        for item in result["signals"]
-    ]
-
+    signals = [item["signal"] for item in result["signals"]]
     assert "LONG-A" in signals
 
 
@@ -159,7 +147,6 @@ def test_long_breakout_confirmation(engine):
         previous_hist=0.2,
         previous_high=105
     )
-
     result = engine.analyze(
         "ETH-USDT-SWAP",
         df,
@@ -167,18 +154,15 @@ def test_long_breakout_confirmation(engine):
         relative_strength_1h=2,
         relative_strength_4h=2
     )
-
-    signals = [
-        item["signal"]
-        for item in result["signals"]
-    ]
-
+    signals = [item["signal"] for item in result["signals"]]
     assert "LONG-B" in signals
 
 
 def test_short_early_entry(engine):
     df = make_features(
         close=99,
+        high=102,
+        low=98,
         ema7=99.5,
         ema20=100,
         ema50=101,
@@ -191,7 +175,6 @@ def test_short_early_entry(engine):
         minus_di=30,
         previous_low=90
     )
-
     result = engine.analyze(
         "ETH-USDT-SWAP",
         df,
@@ -199,12 +182,7 @@ def test_short_early_entry(engine):
         relative_strength_1h=-2,
         relative_strength_4h=-1
     )
-
-    signals = [
-        item["signal"]
-        for item in result["signals"]
-    ]
-
+    signals = [item["signal"] for item in result["signals"]]
     assert "SHORT-A" in signals
 
 
@@ -224,7 +202,6 @@ def test_short_breakdown_confirmation(engine):
         minus_di=35,
         previous_low=94
     )
-
     result = engine.analyze(
         "ETH-USDT-SWAP",
         df,
@@ -232,115 +209,57 @@ def test_short_breakdown_confirmation(engine):
         relative_strength_1h=-2,
         relative_strength_4h=-2
     )
-
-    signals = [
-        item["signal"]
-        for item in result["signals"]
-    ]
-
+    signals = [item["signal"] for item in result["signals"]]
     assert "SHORT-B" in signals
 
 
 def test_long_score_increases_when_stronger_than_btc(engine):
     features = engine._common_features(make_features())
-
-    score_without_rs, _ = engine._score_long(
-        features,
-        relative_strength=0
-    )
-
-    score_with_rs, _ = engine._score_long(
-        features,
-        relative_strength=3
-    )
-
+    score_without_rs, _ = engine._score_long(features, relative_strength=0)
+    score_with_rs, _ = engine._score_long(features, relative_strength=3)
     assert score_with_rs > score_without_rs
 
 
 def test_short_score_increases_when_weaker_than_btc(engine):
     features = engine._common_features(make_features())
-
-    score_without_rs, _ = engine._score_short(
-        features,
-        relative_strength=0
-    )
-
-    score_with_rs, _ = engine._score_short(
-        features,
-        relative_strength=-3
-    )
-
+    score_without_rs, _ = engine._score_short(features, relative_strength=0)
+    score_with_rs, _ = engine._score_short(features, relative_strength=-3)
     assert score_with_rs > score_without_rs
 
 
 def test_long_score_penalty_when_weak_against_btc(engine):
     features = engine._common_features(make_features())
-
-    normal_score, _ = engine._score_long(
-        features,
-        relative_strength=0
-    )
-
-    weak_score, _ = engine._score_long(
-        features,
-        relative_strength=-3
-    )
-
+    normal_score, _ = engine._score_long(features, relative_strength=0)
+    weak_score, _ = engine._score_long(features, relative_strength=-3)
     assert weak_score < normal_score
 
 
 def test_short_score_penalty_when_strong_against_btc(engine):
     features = engine._common_features(make_features())
-
-    normal_score, _ = engine._score_short(
-        features,
-        relative_strength=0
-    )
-
-    strong_score, _ = engine._score_short(
-        features,
-        relative_strength=3
-    )
-
+    normal_score, _ = engine._score_short(features, relative_strength=0)
+    strong_score, _ = engine._score_short(features, relative_strength=3)
     assert strong_score < normal_score
 
 
 def test_minimum_score_blocks_signal(engine):
     engine.min_score = 101
-
     df = make_features()
-
-    result = engine.analyze(
-        "ETH-USDT-SWAP",
-        df,
-        df
-    )
-
+    result = engine.analyze("ETH-USDT-SWAP", df, df)
     assert result["signals"] == []
 
 
 def test_long_signal_can_be_disabled(engine, monkeypatch):
     monkeypatch.setattr(Config, "ENABLE_LONG", False)
-
     df = make_features()
-
-    result = engine.analyze(
-        "ETH-USDT-SWAP",
-        df,
-        df
-    )
-
-    assert all(
-        item["direction"] != "LONG"
-        for item in result["signals"]
-    )
+    result = engine.analyze("ETH-USDT-SWAP", df, df)
+    assert all(item["direction"] != "LONG" for item in result["signals"])
 
 
 def test_short_signal_can_be_disabled(engine, monkeypatch):
     monkeypatch.setattr(Config, "ENABLE_SHORT", False)
-
     df = make_features(
         close=99,
+        low=98,
         ema7=99.5,
         ema20=100,
         ema50=101,
@@ -352,28 +271,13 @@ def test_short_signal_can_be_disabled(engine, monkeypatch):
         plus_di=15,
         minus_di=30
     )
-
-    result = engine.analyze(
-        "ETH-USDT-SWAP",
-        df,
-        df
-    )
-
-    assert all(
-        item["direction"] != "SHORT"
-        for item in result["signals"]
-    )
+    result = engine.analyze("ETH-USDT-SWAP", df, df)
+    assert all(item["direction"] != "SHORT" for item in result["signals"])
 
 
 def test_signal_is_simulation_only(engine):
     df = make_features()
-
-    result = engine.analyze(
-        "ETH-USDT-SWAP",
-        df,
-        df
-    )
-
+    result = engine.analyze("ETH-USDT-SWAP", df, df)
     for signal in result["signals"]:
         assert signal["status"] == "simulation_only"
 
