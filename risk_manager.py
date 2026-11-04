@@ -1,9 +1,14 @@
 
+import math
+
 from config import Config
 
 
 class RiskManager:
-    """OKX SMART TRADING V1.0 風險管理模組。"""
+    """OKX SMART TRADING V1.0 風險管理模組。
+
+    僅計算模擬交易計畫，不執行真實下單。
+    """
 
     def __init__(
         self,
@@ -11,44 +16,58 @@ class RiskManager:
         atr_multiplier=1.5,
         reward_risk_ratio=2.0
     ):
-        self.daily_loss_limit_percent = float(
-            daily_loss_limit_percent
+        self.daily_loss_limit_percent = self._positive_number(
+            daily_loss_limit_percent,
+            "daily_loss_limit_percent"
         )
-        self.atr_multiplier = float(atr_multiplier)
-        self.reward_risk_ratio = float(reward_risk_ratio)
+        self.atr_multiplier = self._positive_number(
+            atr_multiplier, "atr_multiplier"
+        )
+        self.reward_risk_ratio = self._positive_number(
+            reward_risk_ratio, "reward_risk_ratio"
+        )
 
-        if not 0 < self.daily_loss_limit_percent <= 10:
-            raise ValueError("Daily loss limit must be between 0 and 10")
-
-        if self.atr_multiplier <= 0:
-            raise ValueError("ATR multiplier must be positive")
-
-        if self.reward_risk_ratio <= 0:
-            raise ValueError("Reward/risk ratio must be positive")
+        if self.daily_loss_limit_percent > 10:
+            raise ValueError("Daily loss limit cannot exceed 10%")
 
     @staticmethod
-    def _positive_number(value, name):
+    def _number(value, name):
         try:
             number = float(value)
         except (TypeError, ValueError):
             raise ValueError(f"{name} must be a number")
+
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be finite")
+
+        return number
+
+    @classmethod
+    def _positive_number(cls, value, name):
+        number = cls._number(value, name)
 
         if number <= 0:
             raise ValueError(f"{name} must be positive")
 
         return number
 
-    @staticmethod
-    def _non_negative_number(value, name):
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{name} must be a number")
+    @classmethod
+    def _non_negative_number(cls, value, name):
+        number = cls._number(value, name)
 
         if number < 0:
             raise ValueError(f"{name} cannot be negative")
 
         return number
+
+    @staticmethod
+    def _validate_side(side):
+        side = str(side).upper()
+
+        if side not in ("LONG", "SHORT"):
+            raise ValueError("side must be LONG or SHORT")
+
+        return side
 
     def calculate_stop_loss(
         self,
@@ -59,6 +78,7 @@ class RiskManager:
     ):
         entry = self._positive_number(entry_price, "entry_price")
         atr_value = self._positive_number(atr, "atr")
+        side = self._validate_side(side)
 
         multiplier = (
             self.atr_multiplier
@@ -68,16 +88,14 @@ class RiskManager:
             )
         )
 
-        side = side.upper()
+        distance = atr_value * multiplier
 
         if side == "LONG":
-            stop = entry - atr_value * multiplier
-        elif side == "SHORT":
-            stop = entry + atr_value * multiplier
+            stop = entry - distance
         else:
-            raise ValueError("side must be LONG or SHORT")
+            stop = entry + distance
 
-        if stop <= 0:
+        if not math.isfinite(stop) or stop <= 0:
             raise ValueError("Calculated stop loss is invalid")
 
         return stop
@@ -91,6 +109,7 @@ class RiskManager:
     ):
         entry = self._positive_number(entry_price, "entry_price")
         stop = self._positive_number(stop_loss, "stop_loss")
+        side = self._validate_side(side)
 
         ratio = (
             self.reward_risk_ratio
@@ -100,22 +119,19 @@ class RiskManager:
             )
         )
 
-        side = side.upper()
-
         if side == "LONG":
             if stop >= entry:
                 raise ValueError("LONG stop loss must be below entry")
+
             target = entry + (entry - stop) * ratio
 
-        elif side == "SHORT":
+        else:
             if stop <= entry:
                 raise ValueError("SHORT stop loss must be above entry")
+
             target = entry - (stop - entry) * ratio
 
-        else:
-            raise ValueError("side must be LONG or SHORT")
-
-        if target <= 0:
+        if not math.isfinite(target) or target <= 0:
             raise ValueError("Calculated take profit is invalid")
 
         return target
@@ -128,10 +144,20 @@ class RiskManager:
         risk_percent=None,
         leverage=None,
         fee_rate=None,
-        slippage_rate=None
+        slippage_rate=None,
+        side=None
     ):
         entry = self._positive_number(entry_price, "entry_price")
         stop = self._positive_number(stop_loss, "stop_loss")
+
+        if side is not None:
+            side = self._validate_side(side)
+
+            if side == "LONG" and stop >= entry:
+                raise ValueError("LONG stop loss must be below entry")
+
+            if side == "SHORT" and stop <= entry:
+                raise ValueError("SHORT stop loss must be above entry")
 
         account_equity = self._positive_number(
             Config.INITIAL_EQUITY_USDT if equity is None else equity,
@@ -177,23 +203,31 @@ class RiskManager:
 
         risk_budget = account_equity * risk_pct / 100
 
-        # 預估進場與出場的手續費及滑價成本。
+        # 預估進場及出場的手續費、滑價成本。
         round_trip_cost_rate = 2 * (fee + slippage)
 
-        # 每單位價格風險加上預估交易成本。
         risk_per_unit = (
             stop_distance + entry * round_trip_cost_rate
         )
 
+        if risk_per_unit <= 0:
+            raise ValueError("Risk per unit is invalid")
+
         quantity_by_risk = risk_budget / risk_per_unit
 
+        # 名目倉位不得超過本金 × 模擬槓桿。
         max_notional = account_equity * max_leverage
         quantity_by_leverage = max_notional / entry
 
-        quantity = min(
+        raw_quantity = min(
             quantity_by_risk,
             quantity_by_leverage
         )
+
+        quantity = round(raw_quantity, 8)
+
+        if quantity <= 0:
+            raise ValueError("Calculated position size is too small")
 
         notional = quantity * entry
         margin_required = notional / max_leverage
@@ -209,14 +243,12 @@ class RiskManager:
             "entry_price": entry,
             "stop_loss": stop,
             "stop_distance": round(stop_distance, 8),
-            "quantity": round(quantity, 8),
+            "quantity": quantity,
             "notional_usdt": round(notional, 4),
             "margin_required_usdt": round(margin_required, 4),
             "leverage": max_leverage,
             "estimated_price_loss_usdt": round(price_risk, 4),
-            "estimated_fee_slippage_usdt": round(
-                estimated_cost, 4
-            ),
+            "estimated_fee_slippage_usdt": round(estimated_cost, 4),
             "estimated_total_risk_usdt": round(
                 estimated_total_risk, 4
             ),
@@ -231,12 +263,11 @@ class RiskManager:
         equity,
         daily_realized_pnl
     ):
+        # equity 在此代表當日開始時的權益基準。
         account_equity = self._positive_number(equity, "equity")
-
-        try:
-            daily_pnl = float(daily_realized_pnl)
-        except (TypeError, ValueError):
-            raise ValueError("daily_realized_pnl must be a number")
+        daily_pnl = self._number(
+            daily_realized_pnl, "daily_realized_pnl"
+        )
 
         loss_limit = (
             account_equity
@@ -256,7 +287,9 @@ class RiskManager:
             "daily_loss_used_usdt": round(loss_used, 4),
             "remaining_loss_limit_usdt": round(remaining, 4),
             "status": (
-                "allowed" if allowed else "daily_loss_limit_reached"
+                "allowed"
+                if allowed
+                else "daily_loss_limit_reached"
             )
         }
 
@@ -269,14 +302,12 @@ class RiskManager:
         equity=None,
         daily_realized_pnl=0
     ):
-        side = side.upper()
-
-        if side not in ("LONG", "SHORT"):
-            raise ValueError("side must be LONG or SHORT")
+        side = self._validate_side(side)
 
         account_equity = (
             Config.INITIAL_EQUITY_USDT
-            if equity is None else equity
+            if equity is None
+            else equity
         )
 
         daily_check = self.check_daily_loss(
@@ -309,7 +340,8 @@ class RiskManager:
         position = self.calculate_position_size(
             entry_price,
             stop,
-            equity=account_equity
+            equity=account_equity,
+            side=side
         )
 
         return {
