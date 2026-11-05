@@ -1,4 +1,5 @@
 
+import math
 import pandas as pd
 
 from config import Config
@@ -40,13 +41,22 @@ class SignalEngine:
         ]
 
         if missing:
-            raise ValueError(f"Missing candle columns: {missing}")
+            raise ValueError(
+                f"Missing candle columns: {missing}"
+            )
 
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        for col in [
+            "open", "high", "low", "close", "volume"
+        ]:
+            df[col] = pd.to_numeric(
+                df[col], errors="coerce"
+            )
 
         df = df.dropna(
-            subset=["open", "high", "low", "close", "volume"]
+            subset=[
+                "open", "high", "low",
+                "close", "volume"
+            ]
         )
 
         df = df.sort_values("timestamp")
@@ -56,19 +66,41 @@ class SignalEngine:
         df = df.reset_index(drop=True)
 
         if len(df) < 30:
-            raise ValueError("Not enough confirmed candles")
+            raise ValueError(
+                "Not enough confirmed candles"
+            )
+
+        if (
+            (df["close"] <= 0).any()
+            or (df["high"] <= 0).any()
+            or (df["low"] <= 0).any()
+            or (df["volume"] < 0).any()
+        ):
+            raise ValueError("Invalid candle prices or volume")
+
+        if (
+            (df["high"] < df["low"]).any()
+            or (df["close"] > df["high"]).any()
+            or (df["close"] < df["low"]).any()
+        ):
+            raise ValueError("Invalid OHLC candle structure")
 
         return df
 
     def _prepare_features(self, candles):
         df = self._candles_to_dataframe(candles)
+
         features = self.indicator_engine.calculate_all(df)
 
         if not isinstance(features, pd.DataFrame):
-            raise TypeError("Indicator engine must return DataFrame")
+            raise TypeError(
+                "Indicator engine must return DataFrame"
+            )
 
         if features.empty:
-            raise ValueError("Indicator calculation returned no data")
+            raise ValueError(
+                "Indicator calculation returned no data"
+            )
 
         return features
 
@@ -82,28 +114,66 @@ class SignalEngine:
         if value is None:
             return None
 
-        return float(value)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+
+        if not math.isfinite(value):
+            return None
+
+        return value
 
     @staticmethod
-    def _normalize_strategy_result(result):
+    def _safe_score(value):
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+        if not math.isfinite(score):
+            return 0.0
+
+        return score
+
+    @classmethod
+    def _normalize_strategy_result(cls, result):
         if not isinstance(result, dict):
-            raise TypeError("StrategyEngine must return a dictionary")
+            raise TypeError(
+                "StrategyEngine must return a dictionary"
+            )
 
         signals = result.get("signals", [])
 
         if not isinstance(signals, list):
             signals = []
 
-        valid_signals = [
-            item for item in signals
-            if isinstance(item, dict)
-            and str(item.get("direction", "")).upper()
-            in ("LONG", "SHORT")
-        ]
+        valid_signals = []
+
+        for item in signals:
+            if not isinstance(item, dict):
+                continue
+
+            direction = str(
+                item.get("direction", "")
+            ).upper()
+
+            if direction not in ("LONG", "SHORT"):
+                continue
+
+            score = cls._safe_score(
+                item.get("score", 0)
+            )
+
+            normalized_item = dict(item)
+            normalized_item["direction"] = direction
+            normalized_item["score"] = score
+
+            valid_signals.append(normalized_item)
 
         best_signal = max(
             valid_signals,
-            key=lambda item: float(item.get("score", 0)),
+            key=lambda item: item["score"],
             default=None
         )
 
@@ -115,17 +185,21 @@ class SignalEngine:
                 "candidate": False,
                 "signal": None,
                 "score": max(
-                    float(result.get("long_score", 0)),
-                    float(result.get("short_score", 0))
+                    cls._safe_score(
+                        result.get("long_score", 0)
+                    ),
+                    cls._safe_score(
+                        result.get("short_score", 0)
+                    )
                 ),
                 "reasons": []
             })
         else:
             normalized.update({
-                "direction": best_signal["direction"].upper(),
+                "direction": best_signal["direction"],
                 "candidate": True,
                 "signal": best_signal.get("signal"),
-                "score": float(best_signal.get("score", 0)),
+                "score": best_signal["score"],
                 "price": best_signal.get("price"),
                 "reasons": best_signal.get("reasons", [])
             })
@@ -141,6 +215,9 @@ class SignalEngine:
         """分析單一 USDT 永續合約，只產生模擬交易計畫。"""
 
         try:
+            if not isinstance(inst_id, str):
+                raise ValueError("Invalid instrument ID")
+
             if not inst_id.endswith("-USDT-SWAP"):
                 raise ValueError(
                     "Only USDT perpetual contracts are supported"
@@ -176,9 +253,15 @@ class SignalEngine:
                 )
             )
 
+            if not isinstance(relative_strength, dict):
+                raise ValueError(
+                    "BTC relative strength data is invalid"
+                )
+
             rs_1h = self._extract_relative_strength(
                 relative_strength.get("1H")
             )
+
             rs_4h = self._extract_relative_strength(
                 relative_strength.get("4H")
             )
@@ -208,17 +291,42 @@ class SignalEngine:
             if candidate and direction in ("LONG", "SHORT"):
                 latest = features_1h.iloc[-1]
 
-                atr_value = latest.get("atr")
+                # 優先讀取指標引擎實際輸出的 ATR 欄位。
+                atr_value = latest.get("atr_14")
 
-                if atr_value is None or pd.isna(atr_value):
-                    raise ValueError("ATR data is unavailable")
+                # 相容舊版欄位名稱。
+                if atr_value is None:
+                    atr_value = latest.get("atr")
 
-                atr_value = float(atr_value)
+                if atr_value is None:
+                    raise ValueError(
+                        "ATR data is unavailable"
+                    )
 
-                if atr_value <= 0:
-                    raise ValueError("ATR must be greater than zero")
+                try:
+                    atr_value = float(atr_value)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "ATR data is invalid"
+                    )
+
+                if (
+                    not math.isfinite(atr_value)
+                    or atr_value <= 0
+                ):
+                    raise ValueError(
+                        "ATR must be a finite positive number"
+                    )
 
                 entry_price = float(latest["close"])
+
+                if (
+                    not math.isfinite(entry_price)
+                    or entry_price <= 0
+                ):
+                    raise ValueError(
+                        "Entry price is invalid"
+                    )
 
                 trade_plan = self.risk_manager.create_trade_plan(
                     symbol=inst_id,
@@ -228,6 +336,11 @@ class SignalEngine:
                     equity=equity,
                     daily_realized_pnl=daily_realized_pnl
                 )
+
+                if not isinstance(trade_plan, dict):
+                    raise ValueError(
+                        "Risk manager returned an invalid trade plan"
+                    )
 
             return {
                 "symbol": inst_id,
@@ -257,6 +370,9 @@ class SignalEngine:
 
     def analyze_multiple(self, symbols, equity=None):
         return [
-            self.analyze_symbol(symbol, equity=equity)
+            self.analyze_symbol(
+                symbol,
+                equity=equity
+            )
             for symbol in symbols
         ]
