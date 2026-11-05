@@ -12,8 +12,22 @@ class MarketScanner:
     OKX SMART TRADING V1.0
 
     USDT 永續合約市場掃描器。
+
+    支援：
+    - LONG-A 提前埋伏做多
+    - LONG-B 突破確認做多
+    - SHORT-A 提前埋伏做空
+    - SHORT-B 跌破確認做空
+
     僅分析行情與模擬交易訊號，不執行真實下單。
     """
+
+    STRATEGY_NAMES = (
+        "LONG-A",
+        "LONG-B",
+        "SHORT-A",
+        "SHORT-B"
+    )
 
     def __init__(
         self,
@@ -168,10 +182,6 @@ class MarketScanner:
         return symbols
 
     def _get_symbols(self):
-        """
-        依 24 小時估算成交額取得熱門 USDT 永續合約。
-        """
-
         market_rows = self.market_data.get_top_symbols(
             limit=self.max_symbols
         )
@@ -194,9 +204,145 @@ class MarketScanner:
             "status": "error",
             "error": str(exc),
             "trade_plan": None,
+            "strategy_trade_plans": {},
             "trading_mode": "simulation_only",
             "auto_trading": False
         }
+
+    @staticmethod
+    def _empty_strategy_lists():
+        return {
+            "long_a_candidates": [],
+            "long_b_candidates": [],
+            "short_a_candidates": [],
+            "short_b_candidates": []
+        }
+
+    @classmethod
+    def _get_strategy_signals(cls, item):
+        strategy = item.get("strategy") or {}
+
+        if not isinstance(strategy, dict):
+            return []
+
+        signals = strategy.get("signals", [])
+
+        if not isinstance(signals, list):
+            return []
+
+        return signals
+
+    @classmethod
+    def _build_strategy_candidate(cls, item, signal):
+        """
+        建立單一策略排行榜資料。
+
+        每個訊號使用自己的分數及交易計畫，
+        不使用其他策略的交易計畫。
+        """
+
+        if not isinstance(signal, dict):
+            return None
+
+        name = str(
+            signal.get("signal", "")
+        ).upper()
+
+        if name not in cls.STRATEGY_NAMES:
+            return None
+
+        expected_direction = (
+            "LONG"
+            if name.startswith("LONG")
+            else "SHORT"
+        )
+
+        direction = str(
+            signal.get("direction", "")
+        ).upper()
+
+        if direction != expected_direction:
+            return None
+
+        score = cls._safe_float(
+            signal.get("score")
+        )
+
+        if score is None or not 0 <= score <= 100:
+            return None
+
+        price = cls._safe_float(
+            signal.get("price")
+        )
+
+        if price is not None and price <= 0:
+            price = None
+
+        strategy_plans = item.get(
+            "strategy_trade_plans"
+        ) or {}
+
+        if not isinstance(strategy_plans, dict):
+            strategy_plans = {}
+
+        trade_plan = strategy_plans.get(name)
+
+        if not isinstance(trade_plan, dict):
+            trade_plan = signal.get("trade_plan")
+
+        if not isinstance(trade_plan, dict):
+            trade_plan = None
+
+        reasons = signal.get("reasons", [])
+
+        if not isinstance(reasons, list):
+            reasons = []
+
+        candidate = {
+            "symbol": item.get("symbol"),
+            "strategy": name,
+            "direction": direction,
+            "score": score,
+            "price": price,
+            "reasons": reasons,
+            "timeframes": signal.get("timeframes", {}),
+            "fibonacci": signal.get("fibonacci"),
+            "invalidation_price": signal.get(
+                "invalidation_price"
+            ),
+            "trade_plan": trade_plan,
+            "status": "simulation_only",
+            "auto_trading": False
+        }
+
+        if isinstance(trade_plan, dict):
+            for key in (
+                "entry_price",
+                "stop_loss",
+                "tp1",
+                "tp2",
+                "take_profit",
+                "reward_risk_ratio",
+                "tp1_reward_risk_ratio",
+                "tp2_reward_risk_ratio",
+                "position"
+            ):
+                if key in trade_plan:
+                    candidate[key] = trade_plan[key]
+
+        return candidate
+
+    @staticmethod
+    def _sort_candidates(candidates):
+        candidates.sort(
+            key=lambda item: (
+                item.get("score", 0),
+                item.get("symbol", "")
+            ),
+            reverse=True
+        )
+
+        return candidates
 
     def scan(self, equity=None):
         """
@@ -207,6 +353,8 @@ class MarketScanner:
         """
 
         started_at = self._timestamp()
+
+        empty_lists = self._empty_strategy_lists()
 
         try:
             symbols = self._get_symbols()
@@ -226,6 +374,7 @@ class MarketScanner:
                 "long_candidates": [],
                 "short_candidates": [],
                 "strong_coins": [],
+                **empty_lists,
                 "auto_trading": False,
                 "trading_mode": "simulation_only"
             }
@@ -249,10 +398,12 @@ class MarketScanner:
                     continue
 
                 result = dict(result)
+
                 result["symbol"] = result.get(
                     "symbol",
                     symbol
                 )
+
                 result["scan_symbol"] = symbol
 
                 if result.get("status") not in (
@@ -265,6 +416,11 @@ class MarketScanner:
                         "Unknown analysis status"
                     )
                     result["trade_plan"] = None
+                    result["strategy_trade_plans"] = {}
+
+                if result.get("status") == "error":
+                    result["trade_plan"] = None
+                    result["strategy_trade_plans"] = {}
 
                 result["trading_mode"] = "simulation_only"
                 result["auto_trading"] = False
@@ -290,6 +446,18 @@ class MarketScanner:
         short_candidates = []
         strong_coins = []
 
+        long_a_candidates = []
+        long_b_candidates = []
+        short_a_candidates = []
+        short_b_candidates = []
+
+        strategy_lists = {
+            "LONG-A": long_a_candidates,
+            "LONG-B": long_b_candidates,
+            "SHORT-A": short_a_candidates,
+            "SHORT-B": short_b_candidates
+        }
+
         for item in successful:
             direction = self._get_direction(item)
             candidate = self._get_candidate(item)
@@ -312,14 +480,35 @@ class MarketScanner:
             ):
                 strong_coins.append(item)
 
-            if not candidate:
-                continue
+            # 保留舊版 LONG / SHORT 總排行榜。
+            if candidate:
+                if direction == "LONG":
+                    long_candidates.append(item)
 
-            if direction == "LONG":
-                long_candidates.append(item)
+                elif direction == "SHORT":
+                    short_candidates.append(item)
 
-            elif direction == "SHORT":
-                short_candidates.append(item)
+            # 新版：四種策略獨立排行榜。
+            signals = self._get_strategy_signals(item)
+
+            for signal in signals:
+                strategy_candidate = (
+                    self._build_strategy_candidate(
+                        item,
+                        signal
+                    )
+                )
+
+                if strategy_candidate is None:
+                    continue
+
+                strategy_name = (
+                    strategy_candidate["strategy"]
+                )
+
+                strategy_lists[strategy_name].append(
+                    strategy_candidate
+                )
 
         long_candidates.sort(
             key=lambda item: item.get("score", 0),
@@ -340,22 +529,40 @@ class MarketScanner:
             reverse=True
         )
 
+        for candidates in strategy_lists.values():
+            self._sort_candidates(candidates)
+
         return {
             "application": Config.APP_NAME,
             "status": "completed",
             "started_at": started_at,
             "finished_at": self._timestamp(),
+
             "total_symbols": len(symbols),
             "total_scanned": len(results),
             "successful": len(successful),
             "failed": len(failed),
+
             "long_count": len(long_candidates),
             "short_count": len(short_candidates),
             "strong_coin_count": len(strong_coins),
+
+            "long_a_count": len(long_a_candidates),
+            "long_b_count": len(long_b_candidates),
+            "short_a_count": len(short_a_candidates),
+            "short_b_count": len(short_b_candidates),
+
             "long_candidates": long_candidates,
             "short_candidates": short_candidates,
             "strong_coins": strong_coins,
+
+            "long_a_candidates": long_a_candidates,
+            "long_b_candidates": long_b_candidates,
+            "short_a_candidates": short_a_candidates,
+            "short_b_candidates": short_b_candidates,
+
             "results": results,
+
             "trading_mode": "simulation_only",
             "auto_trading": False
         }
