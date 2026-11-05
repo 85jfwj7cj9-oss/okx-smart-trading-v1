@@ -13,6 +13,37 @@ app = Flask(__name__)
 APP_NAME = "OKX SMART TRADING V1.0"
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei")
 
+STRATEGY_PANELS = [
+    {
+        "key": "long_a_candidates",
+        "title": "🟢 LONG-A 提前埋伏做多",
+        "panel": "longAPanel",
+        "list": "longAList",
+        "direction": "long",
+    },
+    {
+        "key": "long_b_candidates",
+        "title": "🚀 LONG-B 突破確認做多",
+        "panel": "longBPanel",
+        "list": "longBList",
+        "direction": "long",
+    },
+    {
+        "key": "short_a_candidates",
+        "title": "🔴 SHORT-A 提前埋伏做空",
+        "panel": "shortAPanel",
+        "list": "shortAList",
+        "direction": "short",
+    },
+    {
+        "key": "short_b_candidates",
+        "title": "📉 SHORT-B 跌破確認做空",
+        "panel": "shortBPanel",
+        "list": "shortBList",
+        "direction": "short",
+    },
+]
+
 
 def current_time():
     try:
@@ -56,25 +87,39 @@ def home():
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ app_name }}</title>
+
 <style>
 * { box-sizing: border-box; }
+
 body {
     margin: 0;
-    padding: 18px;
+    padding: 14px;
     background: #101827;
     color: white;
     font-family: Arial, sans-serif;
 }
-.container { max-width: 850px; margin: auto; }
+
+.container {
+    max-width: 850px;
+    margin: auto;
+}
+
 .panel {
     background: #1e293b;
-    padding: 20px;
+    padding: 17px;
     border-radius: 14px;
-    margin-bottom: 16px;
+    margin-bottom: 15px;
+    overflow-wrap: anywhere;
 }
-h1 { font-size: 23px; }
-h2 { font-size: 18px; }
-.muted { color: #94a3b8; font-size: 13px; }
+
+h1 { font-size: 22px; }
+h2 { font-size: 18px; margin-top: 0; }
+
+.muted {
+    color: #94a3b8;
+    font-size: 13px;
+}
+
 input {
     width: 100%;
     padding: 13px;
@@ -84,6 +129,7 @@ input {
     color: white;
     margin: 8px 0;
 }
+
 button {
     width: 100%;
     padding: 14px;
@@ -95,32 +141,83 @@ button {
     font-weight: bold;
     margin-top: 10px;
 }
+
 button:disabled { opacity: .5; }
-.status { color: #4ade80; font-weight: bold; }
+
+.status {
+    color: #4ade80;
+    font-weight: bold;
+}
+
 .error { color: #f87171; }
+
 .card {
     background: #0f172a;
-    padding: 13px;
+    padding: 14px;
     border-radius: 9px;
-    margin: 9px 0;
+    margin: 10px 0;
+    line-height: 1.7;
 }
+
 .long { border-left: 4px solid #22c55e; }
 .short { border-left: 4px solid #ef4444; }
-.neutral { color: #94a3b8; }
-.price { font-size: 19px; font-weight: bold; }
+.neutral { border-left: 4px solid #64748b; }
+
+.price {
+    font-size: 19px;
+    font-weight: bold;
+    margin-bottom: 5px;
+}
+
+.score {
+    font-weight: bold;
+    color: #facc15;
+}
+
+.detail {
+    color: #cbd5e1;
+    font-size: 13px;
+    margin-top: 5px;
+}
+
 a { color: #60a5fa; }
+
+.summary-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.summary-item {
+    background: #0f172a;
+    padding: 10px;
+    border-radius: 8px;
+    font-size: 13px;
+}
+
+@media (max-width: 420px) {
+    body { padding: 9px; }
+    .panel { padding: 13px; }
+}
 </style>
 </head>
+
 <body>
 <div class="container">
 
 <div class="panel">
     <h1>{{ app_name }}</h1>
     <p class="status">● 網頁伺服器已啟動</p>
-    <p class="muted">交易模式：模擬觀察，不會自動下單</p>
-    <p id="serverTime" class="muted">讀取系統時間中...</p>
-    <p><a href="/health">健康檢查</a> |
-       <a href="/api/status">API 狀態</a></p>
+    <p class="muted">
+        交易模式：模擬觀察，不會自動下單
+    </p>
+    <p id="serverTime" class="muted">
+        讀取系統時間中...
+    </p>
+    <p>
+        <a href="/health">健康檢查</a> |
+        <a href="/api/status">API 狀態</a>
+    </p>
 </div>
 
 <div class="panel">
@@ -128,30 +225,55 @@ a { color: #60a5fa; }
     <p class="muted">
         請輸入部署時設定的 SCAN_API_KEY，才可執行掃描。
     </p>
+
     <input
         id="scanKey"
         type="password"
         placeholder="輸入掃描授權碼"
         autocomplete="off"
     >
+
     <button id="scanButton" onclick="runScan()">
         開始掃描 OKX 市場
     </button>
-    <p id="scanStatus" class="muted">等待掃描指令</p>
+
+    <p id="scanStatus" class="muted">
+        等待掃描指令
+    </p>
 </div>
 
 <div id="summary" class="panel" hidden>
-    <h2>掃描結果摘要</h2>
-    <div id="summaryContent"></div>
+    <h2>📊 掃描結果摘要</h2>
+    <div id="summaryContent" class="summary-grid"></div>
+</div>
+
+<div id="longAPanel" class="panel" hidden>
+    <h2>🟢 LONG-A 提前埋伏做多</h2>
+    <div id="longAList"></div>
+</div>
+
+<div id="longBPanel" class="panel" hidden>
+    <h2>🚀 LONG-B 突破確認做多</h2>
+    <div id="longBList"></div>
+</div>
+
+<div id="shortAPanel" class="panel" hidden>
+    <h2>🔴 SHORT-A 提前埋伏做空</h2>
+    <div id="shortAList"></div>
+</div>
+
+<div id="shortBPanel" class="panel" hidden>
+    <h2>📉 SHORT-B 跌破確認做空</h2>
+    <div id="shortBList"></div>
 </div>
 
 <div id="longPanel" class="panel" hidden>
-    <h2>🟢 LONG 多方候選</h2>
+    <h2>🟢 舊版 LONG 多方候選</h2>
     <div id="longList"></div>
 </div>
 
 <div id="shortPanel" class="panel" hidden>
-    <h2>🔴 SHORT 空方候選</h2>
+    <h2>🔴 舊版 SHORT 空方候選</h2>
     <div id="shortList"></div>
 </div>
 
@@ -161,7 +283,7 @@ a { color: #60a5fa; }
 </div>
 
 <div id="errorPanel" class="panel" hidden>
-    <h2>掃描錯誤</h2>
+    <h2>⚠️ 掃描錯誤</h2>
     <div id="errorList"></div>
 </div>
 
@@ -172,39 +294,119 @@ const keyInput = document.getElementById("scanKey");
 const scanButton = document.getElementById("scanButton");
 const scanStatus = document.getElementById("scanStatus");
 
+function addLine(card, text, className = "detail") {
+    const div = document.createElement("div");
+    div.className = className;
+    div.textContent = text;
+    card.appendChild(div);
+}
+
 function makeCard(item, direction) {
     const card = document.createElement("div");
     card.className = "card " + direction;
 
-    const title = document.createElement("div");
-    title.className = "price";
-    title.textContent = item.symbol || item.scan_symbol || "未知幣種";
+    const symbol = document.createElement("div");
+    symbol.className = "price";
+    symbol.textContent =
+        item.symbol || item.scan_symbol || "未知幣種";
+    card.appendChild(symbol);
 
-    const detail = document.createElement("div");
-    detail.textContent =
-        "方向：" + (item.direction || "NEUTRAL") +
-        " ｜ 分數：" + (item.score ?? 0);
+    const score = document.createElement("div");
+    score.className = "score";
+    score.textContent =
+        "策略評分：" + (item.score ?? "無資料") + " 分";
+    card.appendChild(score);
 
-    const signal = document.createElement("div");
-    const strategy = item.strategy || {};
-    signal.textContent =
-        "訊號：" + (strategy.signal || "無") +
-        " ｜ BTC 相對強度：" +
-        (item.average_relative_strength_pct ?? "無資料") + "%";
+    addLine(
+        card,
+        "方向：" + (item.direction || "NEUTRAL")
+    );
 
-    const plan = document.createElement("div");
-    const trade = item.trade_plan;
-
-    if (trade) {
-        plan.textContent =
-            "進場：" + (trade.entry_price ?? "無") +
-            " ｜ 停損：" + (trade.stop_loss ?? "無") +
-            " ｜ 停利：" + (trade.take_profit ?? "無");
-    } else {
-        plan.textContent = "目前沒有模擬交易計畫";
+    if (item.strategy) {
+        addLine(
+            card,
+            "策略訊號：" +
+            (item.strategy.signal || item.strategy.name || "無")
+        );
+    } else if (item.strategy_name) {
+        addLine(card, "策略：" + item.strategy_name);
     }
 
-    card.append(title, detail, signal, plan);
+    if (item.price !== undefined && item.price !== null) {
+        addLine(card, "最新參考價格：" + item.price);
+    }
+
+    if (
+        item.average_relative_strength_pct !== undefined &&
+        item.average_relative_strength_pct !== null
+    ) {
+        addLine(
+            card,
+            "BTC 相對強度：" +
+            item.average_relative_strength_pct + "%"
+        );
+    }
+
+    const trade = item.trade_plan || {};
+
+    const entry = trade.entry_price ?? item.entry_price;
+    const stop = trade.stop_loss ?? item.stop_loss;
+    const tp1 = trade.tp1 ?? item.tp1;
+    const tp2 = trade.tp2 ?? item.tp2;
+    const rr = trade.reward_risk_ratio ??
+               item.reward_risk_ratio;
+
+    addLine(
+        card,
+        "進場：" + (entry ?? "尚無交易計畫")
+    );
+
+    addLine(
+        card,
+        "停損：" + (stop ?? "尚無")
+    );
+
+    addLine(
+        card,
+        "TP1：" + (tp1 ?? "尚無")
+    );
+
+    addLine(
+        card,
+        "TP2：" + (tp2 ?? "尚無")
+    );
+
+    addLine(
+        card,
+        "風險報酬比：" + (rr ?? "尚無")
+    );
+
+    if (trade.status) {
+        addLine(card, "交易計畫狀態：" + trade.status);
+    }
+
+    if (item.invalidation_price !== undefined &&
+        item.invalidation_price !== null) {
+        addLine(
+            card,
+            "訊號失效參考價：" + item.invalidation_price
+        );
+    }
+
+    if (Array.isArray(item.reasons) && item.reasons.length > 0) {
+        addLine(
+            card,
+            "判斷理由：" + item.reasons.join("；")
+        );
+    }
+
+    addLine(
+        card,
+        item.simulation_only === false
+            ? "注意：非模擬訊號"
+            : "模式：模擬觀察，不會自動下單"
+    );
+
     return card;
 }
 
@@ -215,7 +417,7 @@ function renderList(elementId, panelId, items, direction) {
     list.replaceChildren();
     panel.hidden = false;
 
-    if (!items || items.length === 0) {
+    if (!Array.isArray(items) || items.length === 0) {
         const empty = document.createElement("p");
         empty.className = "muted";
         empty.textContent = "目前沒有符合條件的幣種";
@@ -225,6 +427,75 @@ function renderList(elementId, panelId, items, direction) {
 
     items.forEach(item => {
         list.appendChild(makeCard(item, direction));
+    });
+}
+
+function hideAllResultPanels() {
+    const ids = [
+        "summary",
+        "longAPanel",
+        "longBPanel",
+        "shortAPanel",
+        "shortBPanel",
+        "longPanel",
+        "shortPanel",
+        "strongPanel",
+        "errorPanel"
+    ];
+
+    ids.forEach(id => {
+        document.getElementById(id).hidden = true;
+    });
+}
+
+function renderSummary(data) {
+    const summary = document.getElementById("summary");
+    const content = document.getElementById("summaryContent");
+
+    content.replaceChildren();
+    summary.hidden = false;
+
+    const values = [
+        ["掃描幣種", data.total_scanned ?? 0],
+        ["成功", data.successful ?? 0],
+        ["失敗", data.failed ?? 0],
+        ["LONG", data.long_count ?? 0],
+        ["SHORT", data.short_count ?? 0],
+        ["強勢幣", data.strong_coin_count ?? 0],
+        ["LONG-A", data.long_a_count ?? 0],
+        ["LONG-B", data.long_b_count ?? 0],
+        ["SHORT-A", data.short_a_count ?? 0],
+        ["SHORT-B", data.short_b_count ?? 0],
+        ["完成時間", data.finished_at ?? "無資料"]
+    ];
+
+    values.forEach(([label, value]) => {
+        const div = document.createElement("div");
+        div.className = "summary-item";
+        div.textContent = label + "：" + value;
+        content.appendChild(div);
+    });
+}
+
+function renderErrors(results) {
+    const errors = (results || []).filter(
+        item => item.status === "error"
+    );
+
+    if (errors.length === 0) return;
+
+    const panel = document.getElementById("errorPanel");
+    const list = document.getElementById("errorList");
+
+    panel.hidden = false;
+    list.replaceChildren();
+
+    errors.forEach(item => {
+        const p = document.createElement("p");
+        p.textContent =
+            (item.symbol || "未知幣種") +
+            "：" + (item.error || "未知錯誤");
+        list.appendChild(p);
     });
 }
 
@@ -238,14 +509,11 @@ async function runScan() {
     }
 
     scanButton.disabled = true;
-    scanStatus.textContent = "正在取得 OKX 行情並分析，請稍候...";
+    scanStatus.textContent =
+        "正在取得 OKX 行情並分析，請稍候...";
     scanStatus.className = "muted";
 
-    document.getElementById("summary").hidden = true;
-    document.getElementById("longPanel").hidden = true;
-    document.getElementById("shortPanel").hidden = true;
-    document.getElementById("strongPanel").hidden = true;
-    document.getElementById("errorPanel").hidden = true;
+    hideAllResultPanels();
 
     try {
         const response = await fetch("/api/scan", {
@@ -265,63 +533,40 @@ async function runScan() {
             throw new Error(data.error || "掃描未完成");
         }
 
-        const summary = document.getElementById("summary");
-        summary.hidden = false;
+        renderSummary(data);
 
-        const summaryContent =
-            document.getElementById("summaryContent");
-
-        summaryContent.replaceChildren();
-
-        const values = [
-            "掃描幣種：" + data.total_scanned,
-            "成功：" + data.successful,
-            "失敗：" + data.failed,
-            "LONG：" + data.long_count,
-            "SHORT：" + data.short_count,
-            "強勢幣：" + data.strong_coin_count,
-            "完成時間：" + data.finished_at
-        ];
-
-        values.forEach(value => {
-            const p = document.createElement("p");
-            p.textContent = value;
-            summaryContent.appendChild(p);
+        STRATEGY_PANELS.forEach(config => {
+            renderList(
+                config.list,
+                config.panel,
+                data[config.key] || [],
+                config.direction
+            );
         });
 
+        // 保留舊版候選清單
         renderList(
-            "longList", "longPanel",
-            data.long_candidates, "long"
-        );
-
-        renderList(
-            "shortList", "shortPanel",
-            data.short_candidates, "short"
+            "longList",
+            "longPanel",
+            data.long_candidates || [],
+            "long"
         );
 
         renderList(
-            "strongList", "strongPanel",
-            data.strong_coins, "neutral"
+            "shortList",
+            "shortPanel",
+            data.short_candidates || [],
+            "short"
         );
 
-        const errors = (data.results || []).filter(
-            item => item.status === "error"
+        renderList(
+            "strongList",
+            "strongPanel",
+            data.strong_coins || [],
+            "neutral"
         );
 
-        if (errors.length > 0) {
-            const panel = document.getElementById("errorPanel");
-            const list = document.getElementById("errorList");
-            panel.hidden = false;
-            list.replaceChildren();
-
-            errors.forEach(item => {
-                const p = document.createElement("p");
-                p.textContent =
-                    (item.symbol || "未知幣種") +
-                    "：" + (item.error || "未知錯誤");
-                list.appendChild(p);
-            });
-        }
+        renderErrors(data.results);
 
         scanStatus.textContent = "掃描完成";
         scanStatus.className = "status";
@@ -338,8 +583,10 @@ async function loadStatus() {
     try {
         const response = await fetch("/health");
         const data = await response.json();
+
         document.getElementById("serverTime").textContent =
             "伺服器時間：" + data.time;
+
     } catch (error) {
         document.getElementById("serverTime").textContent =
             "無法讀取伺服器狀態";
@@ -380,6 +627,12 @@ def api_status():
             os.getenv("SCAN_API_KEY", "").strip()
         ),
         "timeframes": ["1H", "4H"],
+        "strategies": [
+            "LONG-A",
+            "LONG-B",
+            "SHORT-A",
+            "SHORT-B"
+        ],
         "time": current_time()
     })
 
@@ -414,6 +667,7 @@ def api_scan():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
+
     app.run(
         host="0.0.0.0",
         port=port,
