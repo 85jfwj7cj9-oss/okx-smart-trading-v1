@@ -14,7 +14,9 @@ class RiskManager:
         self,
         daily_loss_limit_percent=3.0,
         atr_multiplier=1.5,
-        reward_risk_ratio=2.0
+        reward_risk_ratio=2.0,
+        tp1_reward_risk_ratio=1.0,
+        min_reward_risk_ratio=1.5
     ):
         self.daily_loss_limit_percent = self._positive_number(
             daily_loss_limit_percent,
@@ -26,6 +28,12 @@ class RiskManager:
         self.reward_risk_ratio = self._positive_number(
             reward_risk_ratio, "reward_risk_ratio"
         )
+        self.tp1_reward_risk_ratio = self._positive_number(
+            tp1_reward_risk_ratio, "tp1_reward_risk_ratio"
+        )
+        self.min_reward_risk_ratio = self._positive_number(
+            min_reward_risk_ratio, "min_reward_risk_ratio"
+        )
 
         if self.daily_loss_limit_percent > 10:
             raise ValueError("Daily loss limit cannot exceed 10%")
@@ -34,7 +42,7 @@ class RiskManager:
     def _number(value, name):
         try:
             number = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"{name} must be a number")
 
         if not math.isfinite(number):
@@ -90,10 +98,11 @@ class RiskManager:
 
         distance = atr_value * multiplier
 
-        if side == "LONG":
-            stop = entry - distance
-        else:
-            stop = entry + distance
+        stop = (
+            entry - distance
+            if side == "LONG"
+            else entry + distance
+        )
 
         if not math.isfinite(stop) or stop <= 0:
             raise ValueError("Calculated stop loss is invalid")
@@ -122,19 +131,69 @@ class RiskManager:
         if side == "LONG":
             if stop >= entry:
                 raise ValueError("LONG stop loss must be below entry")
-
             target = entry + (entry - stop) * ratio
-
         else:
             if stop <= entry:
                 raise ValueError("SHORT stop loss must be above entry")
-
             target = entry - (stop - entry) * ratio
 
         if not math.isfinite(target) or target <= 0:
             raise ValueError("Calculated take profit is invalid")
 
         return target
+
+    def calculate_take_profit_levels(
+        self,
+        entry_price,
+        stop_loss,
+        side,
+        tp1_ratio=None,
+        tp2_ratio=None
+    ):
+        """計算 TP1、TP2 及各自的風險報酬比。"""
+
+        entry = self._positive_number(entry_price, "entry_price")
+        stop = self._positive_number(stop_loss, "stop_loss")
+        side = self._validate_side(side)
+
+        tp1_rr = (
+            self.tp1_reward_risk_ratio
+            if tp1_ratio is None
+            else self._positive_number(tp1_ratio, "tp1_ratio")
+        )
+        tp2_rr = (
+            self.reward_risk_ratio
+            if tp2_ratio is None
+            else self._positive_number(tp2_ratio, "tp2_ratio")
+        )
+
+        if side == "LONG":
+            if stop >= entry:
+                raise ValueError("LONG stop loss must be below entry")
+            distance = entry - stop
+            tp1 = entry + distance * tp1_rr
+            tp2 = entry + distance * tp2_rr
+        else:
+            if stop <= entry:
+                raise ValueError("SHORT stop loss must be above entry")
+            distance = stop - entry
+            tp1 = entry - distance * tp1_rr
+            tp2 = entry - distance * tp2_rr
+
+        if (
+            not math.isfinite(tp1)
+            or not math.isfinite(tp2)
+            or tp1 <= 0
+            or tp2 <= 0
+        ):
+            raise ValueError("Calculated take profit levels are invalid")
+
+        return {
+            "tp1": round(tp1, 8),
+            "tp2": round(tp2, 8),
+            "tp1_reward_risk_ratio": tp1_rr,
+            "tp2_reward_risk_ratio": tp2_rr
+        }
 
     def calculate_position_size(
         self,
@@ -155,7 +214,6 @@ class RiskManager:
 
             if side == "LONG" and stop >= entry:
                 raise ValueError("LONG stop loss must be below entry")
-
             if side == "SHORT" and stop <= entry:
                 raise ValueError("SHORT stop loss must be above entry")
 
@@ -192,7 +250,6 @@ class RiskManager:
 
         if risk_pct > 5:
             raise ValueError("Risk per trade cannot exceed 5%")
-
         if max_leverage > 20:
             raise ValueError("Leverage cannot exceed 20x")
 
@@ -202,8 +259,6 @@ class RiskManager:
             raise ValueError("Entry and stop loss cannot be equal")
 
         risk_budget = account_equity * risk_pct / 100
-
-        # 預估進場及出場的手續費、滑價成本。
         round_trip_cost_rate = 2 * (fee + slippage)
 
         risk_per_unit = (
@@ -214,8 +269,6 @@ class RiskManager:
             raise ValueError("Risk per unit is invalid")
 
         quantity_by_risk = risk_budget / risk_per_unit
-
-        # 名目倉位不得超過本金 × 模擬槓桿。
         max_notional = account_equity * max_leverage
         quantity_by_leverage = max_notional / entry
 
@@ -224,14 +277,14 @@ class RiskManager:
             quantity_by_leverage
         )
 
-        quantity = round(raw_quantity, 8)
+        # 向下取整，避免四捨五入後超出風險預算。
+        quantity = math.floor(raw_quantity * 100000000) / 100000000
 
         if quantity <= 0:
             raise ValueError("Calculated position size is too small")
 
         notional = quantity * entry
         margin_required = notional / max_leverage
-
         price_risk = quantity * stop_distance
         estimated_cost = notional * round_trip_cost_rate
         estimated_total_risk = price_risk + estimated_cost
@@ -258,12 +311,7 @@ class RiskManager:
             "status": "simulation_only"
         }
 
-    def check_daily_loss(
-        self,
-        equity,
-        daily_realized_pnl
-    ):
-        # equity 在此代表當日開始時的權益基準。
+    def check_daily_loss(self, equity, daily_realized_pnl):
         account_equity = self._positive_number(equity, "equity")
         daily_pnl = self._number(
             daily_realized_pnl, "daily_realized_pnl"
@@ -277,7 +325,6 @@ class RiskManager:
 
         loss_used = max(0.0, -daily_pnl)
         remaining = max(0.0, loss_limit - loss_used)
-
         allowed = loss_used < loss_limit
 
         return {
@@ -303,6 +350,7 @@ class RiskManager:
         daily_realized_pnl=0
     ):
         side = self._validate_side(side)
+        entry = self._positive_number(entry_price, "entry_price")
 
         account_equity = (
             Config.INITIAL_EQUITY_USDT
@@ -326,19 +374,39 @@ class RiskManager:
             }
 
         stop = self.calculate_stop_loss(
-            entry_price,
+            entry,
             atr,
             side
         )
 
-        target = self.calculate_take_profit(
-            entry_price,
+        levels = self.calculate_take_profit_levels(
+            entry,
             stop,
             side
         )
 
+        tp1 = levels["tp1"]
+        tp2 = levels["tp2"]
+        rr = levels["tp2_reward_risk_ratio"]
+
+        if rr < self.min_reward_risk_ratio:
+            return {
+                "symbol": symbol,
+                "direction": side,
+                "entry_price": entry,
+                "stop_loss": round(stop, 8),
+                "tp1": tp1,
+                "tp2": tp2,
+                "take_profit": tp2,
+                "reward_risk_ratio": rr,
+                "status": "blocked",
+                "reason": "Reward/risk ratio below minimum",
+                "daily_risk": daily_check,
+                "auto_trading": False
+            }
+
         position = self.calculate_position_size(
-            entry_price,
+            entry,
             stop,
             equity=account_equity,
             side=side
@@ -347,10 +415,16 @@ class RiskManager:
         return {
             "symbol": symbol,
             "direction": side,
-            "entry_price": float(entry_price),
+            "entry_price": entry,
             "stop_loss": round(stop, 8),
-            "take_profit": round(target, 8),
-            "reward_risk_ratio": self.reward_risk_ratio,
+            "tp1": tp1,
+            "tp2": tp2,
+            "take_profit": tp2,
+            "tp1_reward_risk_ratio": levels[
+                "tp1_reward_risk_ratio"
+            ],
+            "tp2_reward_risk_ratio": rr,
+            "reward_risk_ratio": rr,
             "position": position,
             "daily_risk": daily_check,
             "status": "simulation_only",
