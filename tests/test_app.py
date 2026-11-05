@@ -17,7 +17,13 @@ def test_home_page(client):
 
     assert response.status_code == 200
     assert b"OKX SMART TRADING V1.0" in response.data
-    assert b"api/scan" in response.data
+    assert b"/api/scan" in response.data
+
+    # 確認四種策略都有獨立顯示區塊
+    assert b"LONG-A" in response.data
+    assert b"LONG-B" in response.data
+    assert b"SHORT-A" in response.data
+    assert b"SHORT-B" in response.data
 
 
 def test_health_endpoint(client):
@@ -29,6 +35,7 @@ def test_health_endpoint(client):
 
     assert data["status"] == "ok"
     assert data["application"] == app_module.APP_NAME
+    assert "time" in data
 
 
 def test_status_endpoint(client):
@@ -42,6 +49,13 @@ def test_status_endpoint(client):
     assert data["trading_mode"] == "simulation_only"
     assert data["auto_trading"] is False
     assert data["timeframes"] == ["1H", "4H"]
+
+    assert data["strategies"] == [
+        "LONG-A",
+        "LONG-B",
+        "SHORT-A",
+        "SHORT-B"
+    ]
 
 
 def test_scan_without_api_key_is_rejected(
@@ -83,13 +97,42 @@ def test_scan_with_correct_api_key(
                 "total_scanned": 2,
                 "successful": 2,
                 "failed": 0,
+
                 "long_count": 1,
                 "short_count": 1,
                 "strong_coin_count": 1,
+
+                "long_a_count": 1,
+                "long_b_count": 0,
+                "short_a_count": 0,
+                "short_b_count": 1,
+
+                "long_a_candidates": [
+                    {
+                        "symbol": "ETH-USDT-SWAP",
+                        "strategy": "LONG-A",
+                        "direction": "LONG",
+                        "score": 85,
+                        "price": 3000
+                    }
+                ],
+                "long_b_candidates": [],
+                "short_a_candidates": [],
+                "short_b_candidates": [
+                    {
+                        "symbol": "XRP-USDT-SWAP",
+                        "strategy": "SHORT-B",
+                        "direction": "SHORT",
+                        "score": 82,
+                        "price": 0.5
+                    }
+                ],
+
                 "long_candidates": [],
                 "short_candidates": [],
                 "strong_coins": [],
                 "results": [],
+
                 "trading_mode": "simulation_only",
                 "auto_trading": False
             }
@@ -112,6 +155,15 @@ def test_scan_with_correct_api_key(
     assert data["status"] == "completed"
     assert data["total_scanned"] == 2
     assert data["auto_trading"] is False
+
+    # 確認四種策略清單都有回傳
+    assert len(data["long_a_candidates"]) == 1
+    assert len(data["long_b_candidates"]) == 0
+    assert len(data["short_a_candidates"]) == 0
+    assert len(data["short_b_candidates"]) == 1
+
+    assert data["long_a_candidates"][0]["strategy"] == "LONG-A"
+    assert data["short_b_candidates"][0]["strategy"] == "SHORT-B"
 
 
 def test_scan_exception_returns_error(
