@@ -1,3 +1,4 @@
+
 import math
 
 import pandas as pd
@@ -226,7 +227,12 @@ class SignalEngine:
             if score is None or not 0 <= score <= 100:
                 continue
 
-            if price is None or price <= 0:
+            # 沒有價格仍可保留策略訊號，
+            # 但不能用無效價格建立交易計畫。
+            if (
+                signal.get("price") is not None
+                and (price is None or price <= 0)
+            ):
                 continue
 
             signal["signal"] = name
@@ -286,7 +292,20 @@ class SignalEngine:
         for signal in signals:
             name = signal["signal"]
             direction = signal["direction"]
-            entry_price = signal["price"]
+            entry_price = signal.get("price")
+
+            if entry_price is None or entry_price <= 0:
+                plans[name] = {
+                    "symbol": symbol,
+                    "strategy": name,
+                    "direction": direction,
+                    "status": "error",
+                    "reason": "Invalid or missing entry price",
+                    "auto_trading": False
+                }
+
+                signal["trade_plan"] = plans[name]
+                continue
 
             try:
                 plan = self.risk_manager.create_trade_plan(
@@ -345,7 +364,6 @@ class SignalEngine:
                     "BTC is the benchmark and cannot be analyzed against itself"
                 )
 
-            # 取得已收盤的 1H、4H K 線。
             df_1h = self._get_confirmed_candles(
                 inst_id,
                 "1H"
@@ -356,11 +374,9 @@ class SignalEngine:
                 "4H"
             )
 
-            # 計算技術指標。
             features_1h = self._prepare_features(df_1h)
             features_4h = self._prepare_features(df_4h)
 
-            # 取得相對 BTC 強弱。
             relative_data = (
                 self.market_data
                 .get_multi_timeframe_relative_strength(
@@ -376,7 +392,6 @@ class SignalEngine:
                 )
             )
 
-            # 將相對強弱資料傳入策略引擎。
             strategy_result = self.strategy_engine.analyze(
                 inst_id,
                 features_1h,
@@ -389,7 +404,6 @@ class SignalEngine:
                 strategy_result
             )
 
-            # 沒有有效訊號時，不建立交易計畫。
             if not strategy["signals"]:
                 return {
                     "symbol": inst_id,
@@ -404,7 +418,6 @@ class SignalEngine:
                     "auto_trading": False
                 }
 
-            # ATR 必須有效，否則不能建立任何交易計畫。
             if "atr" not in features_1h.columns:
                 raise ValueError(
                     "ATR indicator is missing"
@@ -419,7 +432,6 @@ class SignalEngine:
                     "ATR is invalid; cannot create trade plan"
                 )
 
-            # 四種策略分別建立交易計畫。
             strategy_trade_plans = (
                 self._create_strategy_trade_plans(
                     symbol=inst_id,
@@ -429,8 +441,6 @@ class SignalEngine:
                 )
             )
 
-            # 保留舊版頂層 trade_plan 相容性：
-            # 仍使用最高分訊號的交易計畫。
             best_signal = strategy["signals"][0]
 
             trade_plan = strategy_trade_plans.get(
