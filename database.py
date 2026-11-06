@@ -7,30 +7,79 @@ import threading
 
 from datetime import datetime, timezone
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+
 
 class Database:
     """
-    OKX SMART TRADING V1.1
-    SQLite 資料庫管理模組。
+    OKX SMART TRADING V1.2
+
+    支援：
+    - SQLite：本機及 GitHub Actions 測試
+    - PostgreSQL：Render 正式部署
 
     僅保存行情分析及模擬交易資料。
     不執行真實交易。
     """
 
     def __init__(self, database_path=None):
-        self.database_path = (
-            database_path
-            or os.getenv("DATABASE_PATH", "data/okx_trading.db")
-        )
         self._lock = threading.RLock()
 
-        if self.database_path != ":memory:":
-            directory = os.path.dirname(
-                os.path.abspath(self.database_path)
-            )
-            os.makedirs(directory, exist_ok=True)
+        self.database_url = ""
+        self.database_path = None
+
+        if database_path is not None:
+            self.database_path = str(database_path)
+            self.backend = "sqlite"
+        else:
+            self.database_url = os.getenv(
+                "DATABASE_URL", ""
+            ).strip()
+
+            if self.database_url.startswith("postgres://"):
+                self.database_url = (
+                    "postgresql://"
+                    + self.database_url[len("postgres://"):]
+                )
+
+            if self.database_url:
+                self.backend = "postgresql"
+            else:
+                self.backend = "sqlite"
+                self.database_path = os.getenv(
+                    "DATABASE_PATH",
+                    "data/okx_trading.db"
+                )
+
+        self.connect_timeout = self._safe_int(
+            os.getenv("DATABASE_CONNECT_TIMEOUT", "15"),
+            15,
+            1,
+            120
+        )
+
+        if self.backend == "sqlite":
+            if self.database_path != ":memory:":
+                directory = os.path.dirname(
+                    os.path.abspath(self.database_path)
+                )
+                os.makedirs(directory, exist_ok=True)
 
         self.initialize()
+
+    @staticmethod
+    def _safe_int(value, default, minimum, maximum):
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            result = default
+
+        return max(minimum, min(result, maximum))
 
     @staticmethod
     def _now():
@@ -61,6 +110,18 @@ class Database:
         return number
 
     def _connect(self):
+        if self.backend == "postgresql":
+            if psycopg is None:
+                raise RuntimeError(
+                    "PostgreSQL driver is not installed"
+                )
+
+            return psycopg.connect(
+                self.database_url,
+                connect_timeout=self.connect_timeout,
+                row_factory=dict_row
+            )
+
         connection = sqlite3.connect(
             self.database_path,
             timeout=15
@@ -68,27 +129,88 @@ class Database:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 15000")
+
         return connection
 
-    def _ensure_columns(self, connection, table, columns):
-        existing = {
-            row["name"]
-            for row in connection.execute(
-                f"PRAGMA table_info({table})"
-            ).fetchall()
-        }
+    def _sql(self, statement):
+        if self.backend == "postgresql":
+            return statement.replace("?", "%s")
+        return statement
 
-        for name, definition in columns.items():
-            if name not in existing:
-                connection.execute(
-                    f"ALTER TABLE {table} ADD COLUMN "
-                    f"{name} {definition}"
+    def _table_statements(self):
+        if self.backend == "postgresql":
+            return [
+                """
+                CREATE TABLE IF NOT EXISTS scan_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    scan_time TEXT NOT NULL,
+                    total_scanned INTEGER DEFAULT 0,
+                    successful INTEGER DEFAULT 0,
+                    failed INTEGER DEFAULT 0,
+                    long_count INTEGER DEFAULT 0,
+                    short_count INTEGER DEFAULT 0,
+                    strong_coin_count INTEGER DEFAULT 0,
+                    status TEXT NOT NULL,
+                    result_json TEXT
                 )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS signal_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    score DOUBLE PRECISION DEFAULT 0,
+                    entry_price DOUBLE PRECISION,
+                    stop_loss DOUBLE PRECISION,
+                    take_profit DOUBLE PRECISION,
+                    relative_strength_1h DOUBLE PRECISION,
+                    relative_strength_4h DOUBLE PRECISION,
+                    signal_time TEXT NOT NULL,
+                    status TEXT DEFAULT 'observing',
+                    result_json TEXT,
+                    take_profit_1 DOUBLE PRECISION,
+                    take_profit_2 DOUBLE PRECISION
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS notification_history (
+                    id BIGSERIAL PRIMARY KEY,
+                    notification_key TEXT NOT NULL UNIQUE,
+                    symbol TEXT,
+                    direction TEXT,
+                    message TEXT,
+                    sent_time TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error_message TEXT
+                )
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS simulated_trades (
+                    id BIGSERIAL PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    entry_price DOUBLE PRECISION NOT NULL,
+                    stop_loss DOUBLE PRECISION NOT NULL,
+                    take_profit DOUBLE PRECISION NOT NULL,
+                    quantity DOUBLE PRECISION NOT NULL,
+                    notional_usdt DOUBLE PRECISION NOT NULL,
+                    leverage DOUBLE PRECISION NOT NULL,
+                    entry_time TEXT NOT NULL,
+                    exit_price DOUBLE PRECISION,
+                    exit_time TEXT,
+                    pnl_usdt DOUBLE PRECISION,
+                    status TEXT DEFAULT 'open',
+                    result_json TEXT,
+                    take_profit_1 DOUBLE PRECISION,
+                    take_profit_2 DOUBLE PRECISION,
+                    fees_usdt DOUBLE PRECISION DEFAULT 0,
+                    slippage_usdt DOUBLE PRECISION DEFAULT 0,
+                    net_pnl_usdt DOUBLE PRECISION
+                )
+                """
+            ]
 
-    def initialize(self):
-        """建立資料表、索引及安全升級舊版欄位。"""
-
-        statements = [
+        return [
             """
             CREATE TABLE IF NOT EXISTS scan_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +238,9 @@ class Database:
                 relative_strength_4h REAL,
                 signal_time TEXT NOT NULL,
                 status TEXT DEFAULT 'observing',
-                result_json TEXT
+                result_json TEXT,
+                take_profit_1 REAL,
+                take_profit_2 REAL
             )
             """,
             """
@@ -147,85 +271,149 @@ class Database:
                 exit_time TEXT,
                 pnl_usdt REAL,
                 status TEXT DEFAULT 'open',
-                result_json TEXT
+                result_json TEXT,
+                take_profit_1 REAL,
+                take_profit_2 REAL,
+                fees_usdt REAL DEFAULT 0,
+                slippage_usdt REAL DEFAULT 0,
+                net_pnl_usdt REAL
             )
+            """
+        ]
+
+    def _ensure_columns(self, connection, table, columns):
+        if self.backend == "postgresql":
+            for name, definition in columns.items():
+                connection.execute(
+                    f"ALTER TABLE {table} "
+                    f"ADD COLUMN IF NOT EXISTS {name} {definition}"
+                )
+            return
+
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    f"{name} {definition}"
+                )
+
+    def initialize(self):
+        """建立資料表、索引及安全升級舊版欄位。"""
+
+        indexes = [
+            """
+            CREATE INDEX IF NOT EXISTS idx_scan_time
+            ON scan_history(scan_time)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_signal_symbol
+            ON signal_history(symbol)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_signal_time
+            ON signal_history(signal_time)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_status
+            ON simulated_trades(status)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_symbol
+            ON simulated_trades(symbol)
             """
         ]
 
         with self._lock:
             connection = self._connect()
+
             try:
                 with connection:
-                    for statement in statements:
+                    for statement in self._table_statements():
                         connection.execute(statement)
 
                     self._ensure_columns(
                         connection,
                         "signal_history",
                         {
-                            "take_profit_1": "REAL",
-                            "take_profit_2": "REAL"
+                            "take_profit_1": (
+                                "DOUBLE PRECISION"
+                                if self.backend == "postgresql"
+                                else "REAL"
+                            ),
+                            "take_profit_2": (
+                                "DOUBLE PRECISION"
+                                if self.backend == "postgresql"
+                                else "REAL"
+                            )
                         }
+                    )
+
+                    numeric_type = (
+                        "DOUBLE PRECISION"
+                        if self.backend == "postgresql"
+                        else "REAL"
                     )
 
                     self._ensure_columns(
                         connection,
                         "simulated_trades",
                         {
-                            "take_profit_1": "REAL",
-                            "take_profit_2": "REAL",
-                            "fees_usdt": "REAL DEFAULT 0",
-                            "slippage_usdt": "REAL DEFAULT 0",
-                            "net_pnl_usdt": "REAL"
+                            "take_profit_1": numeric_type,
+                            "take_profit_2": numeric_type,
+                            "fees_usdt": (
+                                f"{numeric_type} DEFAULT 0"
+                            ),
+                            "slippage_usdt": (
+                                f"{numeric_type} DEFAULT 0"
+                            ),
+                            "net_pnl_usdt": numeric_type
                         }
                     )
 
-                    indexes = [
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_scan_time
-                        ON scan_history(scan_time)
-                        """,
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_signal_symbol
-                        ON signal_history(symbol)
-                        """,
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_signal_time
-                        ON signal_history(signal_time)
-                        """,
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_trade_status
-                        ON simulated_trades(status)
-                        """,
-                        """
-                        CREATE INDEX IF NOT EXISTS idx_trade_symbol
-                        ON simulated_trades(symbol)
-                        """
-                    ]
-
                     for statement in indexes:
                         connection.execute(statement)
+
             finally:
                 connection.close()
 
     def _execute_insert(self, sql, values):
         with self._lock:
             connection = self._connect()
+
             try:
                 with connection:
+                    if self.backend == "postgresql":
+                        cursor = connection.execute(
+                            self._sql(sql) + " RETURNING id",
+                            values
+                        )
+                        row = cursor.fetchone()
+                        return row["id"]
+
                     cursor = connection.execute(sql, values)
                     return cursor.lastrowid
+
             finally:
                 connection.close()
 
     def _fetch_all(self, sql, values=()):
         with self._lock:
             connection = self._connect()
+
             try:
                 rows = connection.execute(
-                    sql, values
+                    self._sql(sql), values
                 ).fetchall()
+
                 return [dict(row) for row in rows]
+
             finally:
                 connection.close()
 
@@ -234,8 +422,6 @@ class Database:
         return rows[0] if rows else None
 
     def save_scan(self, result):
-        """保存一輪掃描結果。"""
-
         if not isinstance(result, dict):
             raise ValueError("result must be a dictionary")
 
@@ -244,15 +430,9 @@ class Database:
         return self._execute_insert(
             """
             INSERT INTO scan_history (
-                scan_time,
-                total_scanned,
-                successful,
-                failed,
-                long_count,
-                short_count,
-                strong_coin_count,
-                status,
-                result_json
+                scan_time, total_scanned, successful,
+                failed, long_count, short_count,
+                strong_coin_count, status, result_json
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -270,8 +450,6 @@ class Database:
         )
 
     def save_signal(self, result):
-        """保存具有完整模擬交易計畫的訊號。"""
-
         if not isinstance(result, dict):
             raise ValueError("result must be a dictionary")
 
@@ -304,22 +482,23 @@ class Database:
             plan.get("stop_loss"), "stop_loss", True
         )
 
-        tp1 = plan.get(
+        tp1_value = plan.get(
             "take_profit_1",
             plan.get("tp1", plan.get("take_profit"))
         )
-        tp2 = plan.get(
+        tp2_value = plan.get(
             "take_profit_2",
             plan.get("tp2")
         )
 
-        if tp1 is None:
-            raise ValueError("Trade plan prices are incomplete")
+        tp1 = self._number(
+            tp1_value, "take_profit_1", True
+        )
 
-        tp1 = self._number(tp1, "take_profit_1", True)
-
-        if tp2 is not None:
-            tp2 = self._number(tp2, "take_profit_2", True)
+        tp2 = (
+            self._number(tp2_value, "take_profit_2", True)
+            if tp2_value is not None else None
+        )
 
         if direction == "LONG":
             if not stop < entry < tp1:
@@ -339,8 +518,6 @@ class Database:
             ),
             "score"
         )
-
-        result_json = self._json(result)
 
         return self._execute_insert(
             """
@@ -366,7 +543,7 @@ class Database:
                 relative.get("4H"),
                 self._now(),
                 "observing",
-                result_json
+                self._json(result)
             )
         )
 
@@ -379,8 +556,6 @@ class Database:
         status="sent",
         error_message=None
     ):
-        """保存通知紀錄；相同 key 不會重複新增。"""
-
         if not notification_key:
             raise ValueError("notification_key is required")
 
@@ -403,8 +578,17 @@ class Database:
                     error_message
                 )
             )
+
         except sqlite3.IntegrityError:
             return None
+
+        except Exception as exc:
+            if (
+                psycopg is not None
+                and isinstance(exc, psycopg.IntegrityError)
+            ):
+                return None
+            raise
 
     def notification_exists(self, notification_key):
         row = self._fetch_one(
@@ -417,8 +601,6 @@ class Database:
         return row is not None
 
     def create_simulated_trade(self, trade_plan):
-        """建立模擬交易紀錄，不會送出真實訂單。"""
-
         if not isinstance(trade_plan, dict):
             raise ValueError("trade_plan must be a dictionary")
 
@@ -448,22 +630,31 @@ class Database:
             stop = self._number(
                 trade_plan["stop_loss"], "stop_loss", True
             )
+
             target = self._number(
                 trade_plan.get(
                     "take_profit_1",
-                    trade_plan.get("tp1", trade_plan.get("take_profit"))
+                    trade_plan.get(
+                        "tp1",
+                        trade_plan.get("take_profit")
+                    )
                 ),
                 "take_profit_1",
                 True
             )
+
             tp2_value = trade_plan.get(
                 "take_profit_2",
                 trade_plan.get("tp2")
             )
+
             tp2 = (
-                self._number(tp2_value, "take_profit_2", True)
+                self._number(
+                    tp2_value, "take_profit_2", True
+                )
                 if tp2_value is not None else None
             )
+
             quantity = self._number(
                 position["quantity"], "quantity", True
             )
@@ -473,6 +664,7 @@ class Database:
             leverage = self._number(
                 position["leverage"], "leverage", True
             )
+
         except (KeyError, TypeError):
             raise ValueError("Invalid trade plan values")
 
@@ -491,11 +683,14 @@ class Database:
             trade_plan.get("fees_usdt", 0), "fees_usdt"
         )
         slippage = self._number(
-            trade_plan.get("slippage_usdt", 0), "slippage_usdt"
+            trade_plan.get("slippage_usdt", 0),
+            "slippage_usdt"
         )
 
         if fees < 0 or slippage < 0:
-            raise ValueError("Fees and slippage cannot be negative")
+            raise ValueError(
+                "Fees and slippage cannot be negative"
+            )
 
         return self._execute_insert(
             """
@@ -529,25 +724,22 @@ class Database:
         )
 
     def close_simulated_trade(self, trade_id, exit_price):
-        """
-        結束模擬交易。
-        pnl_usdt 為毛損益；
-        net_pnl_usdt 扣除已設定的費用及滑價估算。
-        """
-
         exit_price = self._number(
             exit_price, "exit_price", True
         )
 
         with self._lock:
             connection = self._connect()
+
             try:
                 with connection:
                     row = connection.execute(
-                        """
-                        SELECT * FROM simulated_trades
-                        WHERE id = ?
-                        """,
+                        self._sql(
+                            """
+                            SELECT * FROM simulated_trades
+                            WHERE id = ?
+                            """
+                        ),
                         (trade_id,)
                     ).fetchone()
 
@@ -558,27 +750,33 @@ class Database:
                         pnl = (
                             exit_price - row["entry_price"]
                         ) * row["quantity"]
+
                     elif row["direction"] == "SHORT":
                         pnl = (
                             row["entry_price"] - exit_price
                         ) * row["quantity"]
-                    else:
-                        raise ValueError("Invalid stored direction")
 
-                    fees = row["fees_usdt"] or 0
-                    slippage = row["slippage_usdt"] or 0
+                    else:
+                        raise ValueError(
+                            "Invalid stored direction"
+                        )
+
+                    fees = row.get("fees_usdt", 0) or 0
+                    slippage = row.get("slippage_usdt", 0) or 0
                     net_pnl = pnl - fees - slippage
 
                     connection.execute(
-                        """
-                        UPDATE simulated_trades
-                        SET exit_price = ?,
-                            exit_time = ?,
-                            pnl_usdt = ?,
-                            net_pnl_usdt = ?,
-                            status = 'closed'
-                        WHERE id = ?
-                        """,
+                        self._sql(
+                            """
+                            UPDATE simulated_trades
+                            SET exit_price = ?,
+                                exit_time = ?,
+                                pnl_usdt = ?,
+                                net_pnl_usdt = ?,
+                                status = 'closed'
+                            WHERE id = ?
+                            """
+                        ),
                         (
                             exit_price,
                             self._now(),
@@ -589,11 +787,13 @@ class Database:
                     )
 
                     return True
+
             finally:
                 connection.close()
 
     def get_scan_history(self, limit=50):
         limit = max(1, min(int(limit), 500))
+
         return self._fetch_all(
             """
             SELECT * FROM scan_history
@@ -604,6 +804,7 @@ class Database:
 
     def get_signal_history(self, limit=50):
         limit = max(1, min(int(limit), 500))
+
         return self._fetch_all(
             """
             SELECT * FROM signal_history
@@ -634,8 +835,6 @@ class Database:
         )
 
     def get_trade_statistics(self):
-        """取得模擬交易統計，不代表真實交易績效。"""
-
         row = self._fetch_one(
             """
             SELECT
@@ -676,20 +875,22 @@ class Database:
         }
 
     def health_check(self):
-        """檢查資料庫是否可以正常讀取。"""
-
         try:
-            row = self._fetch_one("SELECT 1 AS result")
+            row = self._fetch_one(
+                "SELECT 1 AS result"
+            )
+
             return {
                 "status": (
                     "ok"
                     if row and row["result"] == 1
                     else "error"
                 ),
-                "database": "sqlite"
+                "database": self.backend
             }
-        except sqlite3.Error:
+
+        except Exception:
             return {
                 "status": "error",
-                "database": "sqlite"
+                "database": self.backend
             }
