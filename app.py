@@ -1,7 +1,7 @@
 
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request, render_template_string
@@ -15,54 +15,54 @@ from database import Database
 
 app = Flask(__name__)
 
-APP_NAME = "OKX SMART TRADING V1.0"
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei")
-
 _scheduler = None
-_scheduler_lock = threading.Lock()
-
-
-def current_time():
-    try:
-        return datetime.now(ZoneInfo(TIMEZONE)).isoformat()
-    except Exception:
-        return datetime.now().astimezone().isoformat()
+_scheduler_lock = threading.RLock()
+_scheduler_scanner_class = None
 
 
 def get_scanner():
-    max_symbols = int(os.getenv("MAX_SCAN_SYMBOLS", "20"))
-    min_rs = float(os.getenv("MIN_RELATIVE_STRENGTH", "0"))
+    """建立 OKX 市場掃描器。"""
+    max_symbols = int(os.getenv("MAX_SYMBOLS", "100"))
+    min_relative_strength = float(
+        os.getenv("MIN_RELATIVE_STRENGTH", "0")
+    )
 
     return MarketScanner(
         max_symbols=max_symbols,
-        min_relative_strength=min_rs,
+        min_relative_strength=min_relative_strength,
     )
 
 
 def get_scheduler():
     """
-    建立單一排程器實例。
+    取得排程器。
 
-    正式環境明確傳入 Database()，
-    讓掃描、訊號及通知紀錄使用同一個資料庫。
+    當測試替換 MarketScanner 類別時，
+    自動重新建立 scheduler，避免沿用舊的掃描器。
     """
     global _scheduler
+    global _scheduler_scanner_class
 
-    if _scheduler is not None:
+    if (
+        _scheduler is not None
+        and _scheduler_scanner_class is MarketScanner
+    ):
         return _scheduler
 
     with _scheduler_lock:
-        if _scheduler is not None:
+        if (
+            _scheduler is not None
+            and _scheduler_scanner_class is MarketScanner
+        ):
             return _scheduler
 
         scanner = get_scanner()
         notifier = LineNotifier()
         database = Database()
 
-        interval = int(
+        interval_seconds = int(
             os.getenv("SCAN_INTERVAL_SECONDS", "300")
         )
-
         summary_hour = int(
             os.getenv("SUMMARY_HOUR", "21")
         )
@@ -70,690 +70,603 @@ def get_scheduler():
         _scheduler = TradingScheduler(
             scanner=scanner,
             notifier=notifier,
-            database=database,
-            interval_seconds=interval,
+            interval_seconds=interval_seconds,
             summary_hour=summary_hour,
+            database=database,
         )
 
-    return _scheduler
+        _scheduler_scanner_class = MarketScanner
+
+        return _scheduler
 
 
-def verify_scan_key():
-    expected_key = os.getenv("SCAN_API_KEY", "").strip()
+def reset_scheduler():
+    """重設排程器，供測試或管理用途使用。"""
+    global _scheduler
+    global _scheduler_scanner_class
+
+    with _scheduler_lock:
+        if _scheduler is not None:
+            try:
+                _scheduler.stop()
+            except Exception:
+                pass
+
+        _scheduler = None
+        _scheduler_scanner_class = None
+
+
+def get_local_time():
+    """取得台灣時間。"""
+    return datetime.now(
+        ZoneInfo("Asia/Taipei")
+    ).isoformat()
+
+
+def get_scan_key():
+    """取得掃描 API 密碼。"""
+    return (
+        os.getenv("SCAN_API_KEY")
+        or getattr(Config, "SCAN_API_KEY", "")
+        or ""
+    )
+
+
+def check_api_key():
+    """驗證 API 密碼。"""
+    expected_key = get_scan_key()
 
     if not expected_key:
-        return False, "尚未設定 SCAN_API_KEY"
+        return False
 
-    supplied_key = request.headers.get(
-        "X-Scan-Key", ""
-    ).strip()
+    supplied_key = (
+        request.headers.get("X-API-Key")
+        or request.args.get("key")
+        or request.form.get("key")
+    )
 
-    if supplied_key != expected_key:
-        return False, "掃描授權碼錯誤"
+    if not supplied_key:
+        data = request.get_json(silent=True) or {}
+        supplied_key = data.get("key")
 
-    return True, None
-
-
-def authorized_response():
-    authorized, error = verify_scan_key()
-
-    if not authorized:
-        return jsonify({
-            "status": "error",
-            "error": error,
-        }), 401
-
-    return None
+    return supplied_key == expected_key
 
 
-@app.route("/")
-def home():
-    return render_template_string("""
+def strategy_items(result, strategy_name):
+    """取得指定策略的候選清單。"""
+    if not isinstance(result, dict):
+        return []
+
+    items = result.get(strategy_name, [])
+
+    if not isinstance(items, list):
+        return []
+
+    return items
+
+
+def format_price(value):
+    """格式化價格。"""
+    if value is None:
+        return "-"
+
+    try:
+        number = float(value)
+
+        if number >= 1000:
+            return f"{number:,.2f}"
+
+        if number >= 1:
+            return f"{number:.4f}"
+
+        return f"{number:.8f}".rstrip("0").rstrip(".")
+
+    except (TypeError, ValueError):
+        return "-"
+
+
+def render_candidate(candidate):
+    """產生單筆策略訊號 HTML。"""
+    if not isinstance(candidate, dict):
+        return ""
+
+    symbol = candidate.get("symbol", "-")
+    strategy = candidate.get("strategy", "-")
+    direction = candidate.get("direction", "-")
+    score = candidate.get("score", 0)
+
+    plan = candidate.get("trade_plan") or {}
+
+    if not isinstance(plan, dict):
+        plan = {}
+
+    entry = plan.get("entry_price", candidate.get("entry_price"))
+    stop = plan.get("stop_loss", candidate.get("stop_loss"))
+    tp1 = plan.get(
+        "tp1",
+        plan.get("take_profit", candidate.get("take_profit")),
+    )
+    tp2 = plan.get("tp2", candidate.get("tp2"))
+    rr = plan.get("risk_reward_ratio", candidate.get("risk_reward_ratio"))
+
+    return f"""
+    <div class="signal">
+        <div class="signal-top">
+            <strong>{symbol}</strong>
+            <span>{strategy}</span>
+        </div>
+        <div class="meta">
+            方向：{direction}
+            ｜評分：{score}
+        </div>
+        <div class="prices">
+            進場：{format_price(entry)}<br>
+            停損：{format_price(stop)}<br>
+            TP1：{format_price(tp1)}<br>
+            TP2：{format_price(tp2)}<br>
+            風險報酬比：{rr if rr is not None else "-"}
+        </div>
+    </div>
+    """
+
+
+def render_strategy_panel(title, items):
+    """產生策略區塊 HTML。"""
+    if not items:
+        content = '<div class="empty">目前沒有符合條件的訊號</div>'
+    else:
+        content = "".join(
+            render_candidate(item)
+            for item in items
+        )
+
+    return f"""
+    <section class="panel">
+        <h2>{title}</h2>
+        {content}
+    </section>
+    """
+
+
+DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ app_name }}</title>
-<style>
-* { box-sizing: border-box; }
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
+    <title>OKX SMART TRADING V1.0</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
 
-body {
-    margin: 0;
-    padding: 14px;
-    background: #101827;
-    color: white;
-    font-family: Arial, sans-serif;
-}
+        body {
+            margin: 0;
+            padding: 16px;
+            background: #101722;
+            color: #e8edf5;
+            font-family: -apple-system, BlinkMacSystemFont,
+                         "Segoe UI", sans-serif;
+        }
 
-.container {
-    max-width: 850px;
-    margin: auto;
-}
+        .container {
+            max-width: 1100px;
+            margin: auto;
+        }
 
-.panel {
-    background: #1e293b;
-    padding: 17px;
-    border-radius: 14px;
-    margin-bottom: 15px;
-    overflow-wrap: anywhere;
-}
+        h1 {
+            font-size: 25px;
+            margin-bottom: 6px;
+        }
 
-h1 { font-size: 22px; }
-h2 { font-size: 18px; margin-top: 0; }
+        h2 {
+            font-size: 18px;
+            margin-top: 0;
+        }
 
-.muted {
-    color: #94a3b8;
-    font-size: 13px;
-}
+        .subtitle {
+            color: #9ba9ba;
+            font-size: 13px;
+            margin-bottom: 20px;
+        }
 
-input {
-    width: 100%;
-    padding: 13px;
-    border-radius: 8px;
-    border: 1px solid #475569;
-    background: #0f172a;
-    color: white;
-    margin: 8px 0;
-}
+        .toolbar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 18px;
+        }
 
-button {
-    width: 100%;
-    padding: 14px;
-    border: 0;
-    border-radius: 8px;
-    background: #2563eb;
-    color: white;
-    font-size: 16px;
-    font-weight: bold;
-    margin-top: 10px;
-}
+        input, button {
+            border: 0;
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 15px;
+        }
 
-button:disabled { opacity: .5; }
+        input {
+            flex: 1;
+            min-width: 160px;
+            background: #202c3b;
+            color: white;
+        }
 
-.status {
-    color: #4ade80;
-    font-weight: bold;
-}
+        button {
+            background: #2878e5;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
 
-.error { color: #f87171; }
+        button:disabled {
+            opacity: .5;
+        }
 
-.card {
-    background: #0f172a;
-    padding: 14px;
-    border-radius: 9px;
-    margin: 10px 0;
-    line-height: 1.7;
-}
+        .status {
+            background: #1b2736;
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 16px;
+            line-height: 1.8;
+            overflow-wrap: anywhere;
+        }
 
-.long { border-left: 4px solid #22c55e; }
-.short { border-left: 4px solid #ef4444; }
-.neutral { border-left: 4px solid #64748b; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 14px;
+        }
 
-.price {
-    font-size: 19px;
-    font-weight: bold;
-    margin-bottom: 5px;
-}
+        .panel {
+            background: #1b2736;
+            border-radius: 12px;
+            padding: 15px;
+            min-width: 0;
+        }
 
-.score {
-    font-weight: bold;
-    color: #facc15;
-}
+        .signal {
+            background: #263548;
+            border-radius: 9px;
+            padding: 12px;
+            margin-bottom: 10px;
+            overflow-wrap: anywhere;
+        }
 
-.detail {
-    color: #cbd5e1;
-    font-size: 13px;
-    margin-top: 5px;
-}
+        .signal:last-child {
+            margin-bottom: 0;
+        }
 
-.summary-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-}
+        .signal-top {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 15px;
+        }
 
-.summary-item {
-    background: #0f172a;
-    padding: 10px;
-    border-radius: 8px;
-    font-size: 13px;
-}
+        .signal-top span {
+            color: #8ebcff;
+        }
 
-a { color: #60a5fa; }
+        .meta {
+            color: #b8c5d5;
+            font-size: 13px;
+            margin: 8px 0;
+        }
 
-@media (max-width: 420px) {
-    body { padding: 9px; }
-    .panel { padding: 13px; }
-}
-</style>
+        .prices {
+            font-size: 13px;
+            line-height: 1.8;
+            color: #e2e9f2;
+        }
+
+        .empty {
+            color: #8493a6;
+            font-size: 13px;
+        }
+
+        .error {
+            color: #ff8585;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
+        .success {
+            color: #7fe0a1;
+        }
+
+        @media (max-width: 700px) {
+            body {
+                padding: 12px;
+            }
+
+            h1 {
+                font-size: 21px;
+            }
+
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
 </head>
-
 <body>
 <div class="container">
+    <h1>OKX SMART TRADING V1.0</h1>
+    <div class="subtitle">
+        OKX USDT 永續合約｜多空雙向掃描｜模擬訊號
+    </div>
 
-<div class="panel">
-    <h1>{{ app_name }}</h1>
-    <p class="status">● 網頁伺服器已啟動</p>
-    <p class="muted">交易模式：模擬觀察，不會自動下單</p>
-    <p id="serverTime" class="muted">讀取系統時間中...</p>
-    <p id="systemStatus" class="muted">讀取系統狀態中...</p>
-    <p>
-        <a href="/health">健康檢查</a> |
-        <a href="/api/status">API 狀態</a>
-    </p>
-</div>
+    <div class="toolbar">
+        <input id="apiKey"
+               type="password"
+               placeholder="輸入掃描密碼">
+        <button id="scanButton" onclick="runScan()">
+            開始掃描
+        </button>
+    </div>
 
-<div class="panel">
-    <h2>市場掃描控制台</h2>
-    <p class="muted">
-        請輸入部署時設定的 SCAN_API_KEY，才可執行掃描。
-    </p>
-    <input id="scanKey" type="password"
-        placeholder="輸入掃描授權碼" autocomplete="off">
-    <button id="scanButton" onclick="runScan()">
-        開始掃描 OKX 市場
-    </button>
-    <p id="scanStatus" class="muted">等待掃描指令</p>
-</div>
+    <div class="status" id="status">
+        系統狀態：等待掃描<br>
+        請輸入 API 密碼後開始掃描。
+    </div>
 
-<div id="summary" class="panel" hidden>
-    <h2>📊 掃描結果摘要</h2>
-    <div id="summaryContent" class="summary-grid"></div>
-</div>
-
-<div id="longAPanel" class="panel" hidden>
-    <h2>🟢 LONG-A 提前埋伏做多</h2>
-    <div id="longAList"></div>
-</div>
-
-<div id="longBPanel" class="panel" hidden>
-    <h2>🚀 LONG-B 突破確認做多</h2>
-    <div id="longBList"></div>
-</div>
-
-<div id="shortAPanel" class="panel" hidden>
-    <h2>🔴 SHORT-A 提前埋伏做空</h2>
-    <div id="shortAList"></div>
-</div>
-
-<div id="shortBPanel" class="panel" hidden>
-    <h2>📉 SHORT-B 跌破確認做空</h2>
-    <div id="shortBList"></div>
-</div>
-
-<div id="longPanel" class="panel" hidden>
-    <h2>🟢 舊版 LONG 多方候選</h2>
-    <div id="longList"></div>
-</div>
-
-<div id="shortPanel" class="panel" hidden>
-    <h2>🔴 舊版 SHORT 空方候選</h2>
-    <div id="shortList"></div>
-</div>
-
-<div id="strongPanel" class="panel" hidden>
-    <h2>⭐ BTC 相對強勢幣種</h2>
-    <div id="strongList"></div>
-</div>
-
-<div id="errorPanel" class="panel" hidden>
-    <h2>⚠️ 掃描錯誤</h2>
-    <div id="errorList"></div>
-</div>
-
+    <div class="grid" id="panels">
+        <section class="panel">
+            <h2>LONG-A 提前埋伏做多</h2>
+            <div class="empty">等待掃描</div>
+        </section>
+        <section class="panel">
+            <h2>LONG-B 突破確認做多</h2>
+            <div class="empty">等待掃描</div>
+        </section>
+        <section class="panel">
+            <h2>SHORT-A 提前埋伏做空</h2>
+            <div class="empty">等待掃描</div>
+        </section>
+        <section class="panel">
+            <h2>SHORT-B 跌破確認做空</h2>
+            <div class="empty">等待掃描</div>
+        </section>
+    </div>
 </div>
 
 <script>
-const keyInput = document.getElementById("scanKey");
-const scanButton = document.getElementById("scanButton");
-const scanStatus = document.getElementById("scanStatus");
-
-const strategyPanels = [
-    {
-        key: "long_a_candidates",
-        panel: "longAPanel",
-        list: "longAList",
-        direction: "long"
-    },
-    {
-        key: "long_b_candidates",
-        panel: "longBPanel",
-        list: "longBList",
-        direction: "long"
-    },
-    {
-        key: "short_a_candidates",
-        panel: "shortAPanel",
-        list: "shortAList",
-        direction: "short"
-    },
-    {
-        key: "short_b_candidates",
-        panel: "shortBPanel",
-        list: "shortBList",
-        direction: "short"
-    }
-];
-
-function addLine(card, text, className = "detail") {
-    const div = document.createElement("div");
-    div.className = className;
-    div.textContent = text;
-    card.appendChild(div);
-}
-
-function makeCard(item, direction) {
-    const card = document.createElement("div");
-    card.className = "card " + direction;
-
-    const symbol = document.createElement("div");
-    symbol.className = "price";
-    symbol.textContent =
-        item.symbol || item.scan_symbol || "未知幣種";
-    card.appendChild(symbol);
-
-    const score = document.createElement("div");
-    score.className = "score";
-    score.textContent =
-        "策略評分：" + (item.score ?? "無資料") + " 分";
-    card.appendChild(score);
-
-    addLine(card, "方向：" + (item.direction || "NEUTRAL"));
-
-    const strategy = item.strategy;
-    const strategyName =
-        typeof strategy === "string"
-            ? strategy
-            : (
-                strategy?.name ||
-                strategy?.strategy ||
-                item.strategy_name ||
-                "無"
-            );
-
-    addLine(card, "策略：" + strategyName);
-
-    if (item.price !== undefined && item.price !== null) {
-        addLine(card, "最新參考價格：" + item.price);
-    }
-
-    if (
-        item.average_relative_strength_pct !== undefined &&
-        item.average_relative_strength_pct !== null
-    ) {
-        addLine(
-            card,
-            "BTC 相對強度：" +
-            item.average_relative_strength_pct + "%"
-        );
-    }
-
-    const trade = item.trade_plan || {};
-
-    const entry = trade.entry_price ?? item.entry_price;
-    const stop = trade.stop_loss ?? item.stop_loss;
-    const tp1 = trade.tp1 ?? trade.take_profit ?? item.tp1;
-    const tp2 = trade.tp2 ?? item.tp2;
-    const rr = trade.reward_risk_ratio ??
-               item.reward_risk_ratio;
-
-    addLine(card, "進場：" + (entry ?? "尚無交易計畫"));
-    addLine(card, "停損：" + (stop ?? "尚無"));
-    addLine(card, "TP1：" + (tp1 ?? "尚無"));
-    addLine(card, "TP2：" + (tp2 ?? "尚無"));
-    addLine(card, "風險報酬比：" + (rr ?? "尚無"));
-
-    if (trade.status) {
-        addLine(card, "交易計畫狀態：" + trade.status);
-    }
-
-    if (item.invalidation_price !== undefined &&
-        item.invalidation_price !== null) {
-        addLine(
-            card,
-            "訊號失效參考價：" + item.invalidation_price
-        );
-    }
-
-    if (Array.isArray(item.reasons) && item.reasons.length) {
-        addLine(card, "判斷理由：" + item.reasons.join("；"));
-    }
-
-    addLine(
-        card,
-        "模式：模擬觀察，不會自動下單"
-    );
-
-    return card;
-}
-
-function renderList(elementId, panelId, items, direction) {
-    const list = document.getElementById(elementId);
-    const panel = document.getElementById(panelId);
-
-    list.replaceChildren();
-    panel.hidden = false;
-
-    if (!Array.isArray(items) || items.length === 0) {
-        const empty = document.createElement("p");
-        empty.className = "muted";
-        empty.textContent = "目前沒有符合條件的幣種";
-        list.appendChild(empty);
-        return;
-    }
-
-    items.forEach(item => {
-        list.appendChild(makeCard(item, direction));
-    });
-}
-
-function hideAllResultPanels() {
-    [
-        "summary",
-        "longAPanel",
-        "longBPanel",
-        "shortAPanel",
-        "shortBPanel",
-        "longPanel",
-        "shortPanel",
-        "strongPanel",
-        "errorPanel"
-    ].forEach(id => {
-        document.getElementById(id).hidden = true;
-    });
-}
-
-function renderSummary(data) {
-    const summary = document.getElementById("summary");
-    const content = document.getElementById("summaryContent");
-
-    content.replaceChildren();
-    summary.hidden = false;
-
-    const values = [
-        ["掃描幣種", data.total_scanned ?? 0],
-        ["成功", data.successful ?? 0],
-        ["失敗", data.failed ?? 0],
-        ["LONG", data.long_count ?? 0],
-        ["SHORT", data.short_count ?? 0],
-        ["強勢幣", data.strong_coin_count ?? 0],
-        ["LONG-A", data.long_a_count ?? 0],
-        ["LONG-B", data.long_b_count ?? 0],
-        ["SHORT-A", data.short_a_count ?? 0],
-        ["SHORT-B", data.short_b_count ?? 0],
-        ["完成時間", data.finished_at ?? "無資料"]
-    ];
-
-    values.forEach(([label, value]) => {
-        const div = document.createElement("div");
-        div.className = "summary-item";
-        div.textContent = label + "：" + value;
-        content.appendChild(div);
-    });
-}
-
-function renderErrors(results) {
-    const errors = (results || []).filter(
-        item => item.status === "error"
-    );
-
-    if (errors.length === 0) return;
-
-    const panel = document.getElementById("errorPanel");
-    const list = document.getElementById("errorList");
-
-    panel.hidden = false;
-    list.replaceChildren();
-
-    errors.forEach(item => {
-        const p = document.createElement("p");
-        p.textContent =
-            (item.symbol || "未知幣種") +
-            "：" + (item.error || "未知錯誤");
-        list.appendChild(p);
-    });
-}
-
 async function runScan() {
-    const key = keyInput.value.trim();
+    const key = document.getElementById("apiKey").value.trim();
+    const button = document.getElementById("scanButton");
+    const status = document.getElementById("status");
 
     if (!key) {
-        scanStatus.textContent = "請先輸入掃描授權碼";
-        scanStatus.className = "error";
+        status.textContent = "請先輸入掃描密碼。";
         return;
     }
 
-    scanButton.disabled = true;
-    scanStatus.textContent =
-        "正在掃描 OKX 行情、保存資料及處理通知，請稍候...";
-    scanStatus.className = "muted";
-
-    hideAllResultPanels();
+    button.disabled = true;
+    button.textContent = "掃描中...";
+    status.textContent = "正在取得 OKX 市場資料，請稍候...";
 
     try {
         const response = await fetch("/api/scan", {
             method: "POST",
             headers: {
-                "X-Scan-Key": key
-            }
+                "Content-Type": "application/json",
+                "X-API-Key": key
+            },
+            body: JSON.stringify({})
         });
 
         const data = await response.json();
 
         if (!response.ok) {
-            throw new Error(data.error || "掃描請求失敗");
+            throw new Error(data.error || "掃描失敗");
         }
 
-        if (data.status !== "completed") {
-            throw new Error(data.error || "掃描未完成");
-        }
+        const names = [
+            ["long_a", "LONG-A 提前埋伏做多"],
+            ["long_b", "LONG-B 突破確認做多"],
+            ["short_a", "SHORT-A 提前埋伏做空"],
+            ["short_b", "SHORT-B 跌破確認做空"]
+        ];
 
-        renderSummary(data);
+        document.getElementById("panels").innerHTML =
+            names.map(([key, title]) => {
+                const items = Array.isArray(data[key]) ? data[key] : [];
 
-        strategyPanels.forEach(config => {
-            renderList(
-                config.list,
-                config.panel,
-                data[config.key] || [],
-                config.direction
-            );
-        });
+                const content = items.length
+                    ? items.map(item => {
+                        const plan = item.trade_plan || {};
+                        const entry = plan.entry_price ?? "-";
+                        const stop = plan.stop_loss ?? "-";
+                        const tp1 = plan.tp1 ?? plan.take_profit ?? "-";
+                        const tp2 = plan.tp2 ?? "-";
+                        const rr = plan.risk_reward_ratio ?? "-";
 
-        renderList(
-            "longList",
-            "longPanel",
-            data.long_candidates || [],
-            "long"
-        );
+                        return `
+                            <div class="signal">
+                                <div class="signal-top">
+                                    <strong>${escapeHtml(item.symbol || "-")}</strong>
+                                    <span>${escapeHtml(item.strategy || title)}</span>
+                                </div>
+                                <div class="meta">
+                                    方向：${escapeHtml(item.direction || "-")}
+                                    ｜評分：${escapeHtml(item.score ?? "-")}
+                                </div>
+                                <div class="prices">
+                                    進場：${escapeHtml(entry)}<br>
+                                    停損：${escapeHtml(stop)}<br>
+                                    TP1：${escapeHtml(tp1)}<br>
+                                    TP2：${escapeHtml(tp2)}<br>
+                                    風險報酬比：${escapeHtml(rr)}
+                                </div>
+                            </div>
+                        `;
+                    }).join("")
+                    : '<div class="empty">目前沒有符合條件的訊號</div>';
 
-        renderList(
-            "shortList",
-            "shortPanel",
-            data.short_candidates || [],
-            "short"
-        );
+                return `<section class="panel"><h2>${title}</h2>${content}</section>`;
+            }).join("");
 
-        renderList(
-            "strongList",
-            "strongPanel",
-            data.strong_coins || [],
-            "neutral"
-        );
+        const scanned = data.total_scanned ?? "-";
+        const successful = data.successful ?? "-";
+        const failed = data.failed ?? "-";
 
-        renderErrors(data.results);
-
-        scanStatus.textContent =
-            "掃描完成；掃描紀錄及模擬訊號已交由排程器處理";
-        scanStatus.className = "status";
+        status.innerHTML = `
+            <span class="success">掃描完成</span><br>
+            掃描數量：${escapeHtml(scanned)}<br>
+            成功：${escapeHtml(successful)}<br>
+            失敗：${escapeHtml(failed)}<br>
+            更新時間：${new Date().toLocaleString("zh-TW")}
+        `;
 
     } catch (error) {
-        scanStatus.textContent = error.message;
-        scanStatus.className = "error";
+        status.innerHTML =
+            '<span class="error">' +
+            escapeHtml(error.message) +
+            '</span>';
     } finally {
-        scanButton.disabled = false;
+        button.disabled = false;
+        button.textContent = "開始掃描";
     }
 }
 
-async function loadStatus() {
-    try {
-        const response = await fetch("/health");
-        const data = await response.json();
-
-        document.getElementById("serverTime").textContent =
-            "伺服器時間：" + data.time;
-
-        document.getElementById("systemStatus").textContent =
-            "資料庫：" +
-            (data.database?.status || "未檢查") +
-            "；交易模式：模擬觀察";
-
-    } catch (error) {
-        document.getElementById("serverTime").textContent =
-            "無法讀取伺服器狀態";
-    }
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#039;"
+    })[char]);
 }
-
-loadStatus();
 </script>
 </body>
 </html>
-    """, app_name=APP_NAME)
+"""
 
 
-@app.route("/health")
+@app.route("/", methods=["GET"])
+def index():
+    """手機版儀表板首頁。"""
+    return render_template_string(DASHBOARD_HTML)
+
+
+@app.route("/health", methods=["GET"])
 def health():
-    database_status = {
-        "status": "not_checked"
-    }
-
+    """服務健康檢查。"""
     try:
         database = Database()
-        database_status = database.health_check()
+        db_status = database.health_check()
+
+        return jsonify({
+            "status": "ok",
+            "service": "OKX SMART TRADING V1.0",
+            "time": get_local_time(),
+            "database": db_status,
+        }), 200
+
     except Exception as exc:
-        app.logger.exception("Database health check failed")
-        database_status = {
-            "status": "error",
+        return jsonify({
+            "status": "degraded",
+            "service": "OKX SMART TRADING V1.0",
+            "time": get_local_time(),
             "error": str(exc),
-        }
-
-    return jsonify({
-        "status": (
-            "ok"
-            if database_status.get("status") in ("ok", "healthy")
-            else "degraded"
-        ),
-        "application": APP_NAME,
-        "time": current_time(),
-        "database": database_status,
-        "trading_mode": "simulation_only",
-        "auto_trading": False,
-    })
+        }), 503
 
 
-@app.route("/api/status")
+@app.route("/api/status", methods=["GET"])
 def api_status():
-    scheduler_status = {}
-
-    try:
-        if _scheduler is not None:
-            scheduler_status = _scheduler.get_status()
-    except Exception:
-        app.logger.exception("讀取排程狀態失敗")
+    """系統設定與服務狀態。"""
+    line_configured = bool(
+        getattr(Config, "LINE_CHANNEL_ACCESS_TOKEN", "")
+        and getattr(Config, "LINE_TO_USER_ID", "")
+    )
 
     return jsonify({
-        "application": APP_NAME,
-        "version": "1.0.0",
+        "service": "OKX SMART TRADING V1.0",
         "status": "running",
-        "trading_mode": "simulation_only",
-        "auto_trading": False,
-        "okx_market_data": "available_on_scan",
-        "line_notification": (
-            "configured"
-            if LineNotifier().is_configured()
-            else "not_configured"
-        ),
-        "scan_api_key_configured": bool(
-            os.getenv("SCAN_API_KEY", "").strip()
-        ),
+        "time": get_local_time(),
+        "line_configured": line_configured,
         "database_backend": getattr(
-            Config,
-            "DATABASE_BACKEND",
-            "unknown",
+            Config, "DATABASE_BACKEND", "sqlite"
         ),
-        "timeframes": ["1H", "4H"],
+        "timeframes": ["1H", "4H", "1D", "1W"],
         "strategies": [
             "LONG-A",
             "LONG-B",
             "SHORT-A",
             "SHORT-B",
         ],
-        "scheduler": scheduler_status,
-        "time": current_time(),
+        "real_trading": False,
+        "simulation_only": True,
     })
 
 
-@app.route("/api/scheduler/status")
-def api_scheduler_status():
-    auth_response = authorized_response()
-
-    if auth_response:
-        return auth_response
+@app.route("/api/scheduler/status", methods=["GET"])
+def scheduler_status():
+    """排程器狀態。"""
+    if not check_api_key():
+        return jsonify({"error": "未授權"}), 401
 
     try:
         scheduler = get_scheduler()
-
-        return jsonify({
-            "status": "ok",
-            "scheduler": scheduler.get_status(),
-            "trading_mode": "simulation_only",
-            "auto_trading": False,
-        })
+        return jsonify(scheduler.get_status()), 200
 
     except Exception as exc:
-        app.logger.exception("讀取排程器狀態失敗")
-
+        app.logger.exception("取得排程器狀態失敗")
         return jsonify({
-            "status": "error",
-            "error": str(exc),
+            "error": str(exc)
         }), 500
 
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    auth_response = authorized_response()
-
-    if auth_response:
-        return auth_response
+    """執行一次市場掃描。"""
+    if not check_api_key():
+        return jsonify({"error": "未授權，請檢查掃描密碼"}), 401
 
     try:
         scheduler = get_scheduler()
-
-        # 統一由排程器執行掃描、保存紀錄及處理通知。
         result = scheduler.run_once()
 
         if not isinstance(result, dict):
-            raise ValueError("排程器回傳格式錯誤")
+            return jsonify({
+                "error": "掃描器回傳格式錯誤"
+            }), 500
 
-        if result.get("status") == "error":
+        status = result.get("status")
+
+        if status == "error":
             return jsonify(result), 500
 
-        return jsonify(result)
+        return jsonify(result), 200
 
     except Exception as exc:
-        app.logger.exception("Market scan failed")
+        app.logger.exception("市場掃描發生錯誤")
 
         return jsonify({
             "status": "error",
             "error": str(exc),
-            "time": current_time(),
-            "trading_mode": "simulation_only",
-            "auto_trading": False,
+            "time": get_local_time(),
         }), 500
 
 
+@app.errorhandler(404)
+def not_found(_error):
+    return jsonify({
+        "error": "找不到指定的 API 或頁面"
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_error(_error):
+    return jsonify({
+        "error": "伺服器內部錯誤"
+    }), 500
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "5000"))
 
     app.run(
         host="0.0.0.0",
