@@ -1,14 +1,18 @@
 
-import hashlib
 import logging
 import threading
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+import time
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from config import Config
 from scanner import MarketScanner
 from line_notifier import LineNotifier
-from database import Database
+
+try:
+    from database import Database
+except ImportError:
+    Database = None
 
 
 logger = logging.getLogger(__name__)
@@ -16,748 +20,511 @@ logger = logging.getLogger(__name__)
 
 class TradingScheduler:
     """
-    OKX SMART TRADING V1.1
+    OKX SMART TRADING 排程器。
 
-    定時市場掃描、資料庫保存及 LINE 通知排程。
-
-    支援：
-    - LONG-A 提前埋伏做多
-    - LONG-B 突破確認做多
-    - SHORT-A 提前埋伏做空
-    - SHORT-B 跌破確認做空
-    - 掃描歷史保存
-    - 策略訊號歷史保存
-    - LINE 通知成功及失敗紀錄
-    - 持久化通知防重複
-
-    僅提供模擬交易訊號，不執行真實下單。
+    - 定時執行市場掃描
+    - 支援 LONG-A、LONG-B、SHORT-A、SHORT-B
+    - 相容舊版 long_candidates / short_candidates
+    - 只通知 simulation_only 訊號
+    - 支援資料庫掃描、訊號及通知紀錄
+    - 防止重複掃描及重複通知
+    - 不執行真實下單
     """
 
-    STRATEGY_LISTS = {
-        "LONG-A": "long_a_candidates",
-        "LONG-B": "long_b_candidates",
-        "SHORT-A": "short_a_candidates",
-        "SHORT-B": "short_b_candidates"
-    }
+    STRATEGY_LIST_KEYS = (
+        "long_a_candidates",
+        "long_b_candidates",
+        "short_a_candidates",
+        "short_b_candidates",
+    )
 
     def __init__(
         self,
         scanner=None,
         notifier=None,
+        interval_seconds=60,
+        summary_hour=21,
         database=None,
-        interval_seconds=None,
-        summary_hour=21
     ):
         self.scanner = scanner or MarketScanner()
         self.notifier = notifier or LineNotifier()
-        self.database = database or Database()
 
-        self.interval_seconds = max(
-            15,
-            int(
-                interval_seconds
-                if interval_seconds is not None
-                else Config.SCAN_INTERVAL_SECONDS
-            )
-        )
+        self.interval_seconds = max(15, int(interval_seconds))
 
-        if not 0 <= summary_hour <= 23:
-            raise ValueError(
-                "summary_hour must be between 0 and 23"
-            )
+        if not isinstance(summary_hour, int) or not 0 <= summary_hour <= 23:
+            raise ValueError("summary_hour 必須介於 0 至 23")
 
         self.summary_hour = summary_hour
 
+        self.database = database
+        if self.database is None and Database is not None:
+            try:
+                self.database = Database()
+            except Exception:
+                logger.exception("資料庫初始化失敗，排程器將以無資料庫模式運作")
+                self.database = None
+
+        self._thread = None
         self._stop_event = threading.Event()
         self._scan_lock = threading.Lock()
-        self._thread = None
+        self._status_lock = threading.Lock()
 
-        self._last_summary_date = None
+        self._running = False
+        self._last_scan_time = None
         self._last_scan_result = None
+        self._last_error = None
+        self._last_summary_date = None
+
+        self.auto_trading = False
+        self.trading_mode = "simulation_only"
 
     @property
     def is_running(self):
+        with self._status_lock:
+            return self._running
+
+    def get_status(self):
+        with self._status_lock:
+            return {
+                "running": self._running,
+                "interval_seconds": self.interval_seconds,
+                "auto_trading": False,
+                "trading_mode": "simulation_only",
+                "last_scan_time": self._last_scan_time,
+                "last_error": self._last_error,
+                "last_summary_date": (
+                    self._last_summary_date.isoformat()
+                    if self._last_summary_date
+                    else None
+                ),
+            }
+
+    @staticmethod
+    def _is_simulation_candidate(candidate):
+        if not isinstance(candidate, dict):
+            return False
+
+        plan = candidate.get("trade_plan")
+        if not isinstance(plan, dict):
+            return False
+
+        return plan.get("status") == "simulation_only"
+
+    @staticmethod
+    def _get_strategy_name(candidate, fallback=""):
+        strategy = candidate.get("strategy")
+
+        if isinstance(strategy, str) and strategy:
+            return strategy
+
+        if isinstance(strategy, dict):
+            name = strategy.get("name") or strategy.get("strategy")
+            if name:
+                return str(name)
+
         return (
-            self._thread is not None
-            and self._thread.is_alive()
+            candidate.get("strategy_name")
+            or candidate.get("strategy_type")
+            or fallback
         )
 
     @staticmethod
-    def _now():
-        return datetime.now(timezone.utc).isoformat()
-
-    @staticmethod
-    def _safe_float(value, default=None):
-        try:
-            number = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return default
-
-        if number != number or number in (
-            float("inf"),
-            float("-inf")
-        ):
-            return default
-
-        return number
-
-    @staticmethod
-    def _notification_key(candidate):
-        """
-        產生與 LineNotifier.send_signal 相同的訊號識別碼。
-        """
-
+    def _get_candidate_key(candidate):
         plan = candidate.get("trade_plan") or {}
 
-        symbol = str(candidate.get("symbol", "UNKNOWN"))
-        direction = str(
-            candidate.get("direction", "NEUTRAL")
-        ).upper()
+        symbol = str(candidate.get("symbol", "")).upper()
+        direction = str(candidate.get("direction", "")).upper()
+        strategy = (
+            candidate.get("strategy")
+            if isinstance(candidate.get("strategy"), str)
+            else candidate.get("strategy_name", "")
+        )
 
-        entry = plan.get("entry_price")
-        stop = plan.get("stop_loss")
-        target = plan.get(
-            "take_profit",
-            plan.get("tp1", plan.get("take_profit_1"))
+        entry = (
+            plan.get("entry_price")
+            or plan.get("entry")
+            or candidate.get("entry_price")
+            or ""
+        )
+
+        stop = (
+            plan.get("stop_loss")
+            or plan.get("stop")
+            or candidate.get("stop_loss")
+            or ""
+        )
+
+        target = (
+            plan.get("take_profit")
+            or plan.get("tp1")
+            or candidate.get("take_profit")
+            or ""
         )
 
         return (
-            f"{symbol}:{direction}:"
+            f"{symbol}:{direction}:{strategy}:"
             f"{entry}:{stop}:{target}"
         )
 
-    @classmethod
-    def _get_strategy_candidates(cls, scan_result):
+    def _collect_candidates(self, scan_result):
         """
-        取得四種策略的獨立候選訊號。
+        同時支援新版四策略清單及舊版 LONG / SHORT 清單。
         """
+        if isinstance(scan_result, list):
+            return scan_result
+
+        if not isinstance(scan_result, dict):
+            return []
 
         candidates = []
+        seen = set()
 
-        for strategy_name, list_name in (
-            cls.STRATEGY_LISTS.items()
-        ):
-            items = scan_result.get(list_name, [])
+        keys = (
+            "long_candidates",
+            "short_candidates",
+            *self.STRATEGY_LIST_KEYS,
+        )
+
+        for key in keys:
+            items = scan_result.get(key, [])
 
             if not isinstance(items, list):
                 continue
 
-            for item in items:
-                if not isinstance(item, dict):
+            for candidate in items:
+                if not isinstance(candidate, dict):
                     continue
 
-                candidate = dict(item)
+                candidate_copy = dict(candidate)
 
-                candidate["strategy_name"] = strategy_name
+                if not candidate_copy.get("strategy"):
+                    fallback = key.replace("_candidates", "").upper()
+                    candidate_copy["strategy"] = fallback
 
-                candidates.append(candidate)
+                candidate_key = self._get_candidate_key(candidate_copy)
+
+                if candidate_key in seen:
+                    continue
+
+                seen.add(candidate_key)
+                candidates.append(candidate_copy)
 
         return candidates
 
-    @staticmethod
-    def _normalize_trade_plan(candidate):
-        """
-        將 scanner 的交易計畫轉換成
-        LineNotifier 與 Database 可使用的格式。
-        """
+    def _notification_key(self, candidate):
+        return self._get_candidate_key(candidate)
 
-        plan = candidate.get("trade_plan")
+    def _notification_exists(self, notification_key):
+        if self.database is None:
+            return False
 
-        if not isinstance(plan, dict):
-            return None
-
-        plan = dict(plan)
-
-        if plan.get("status") != "simulation_only":
-            return None
-
-        tp1 = plan.get(
-            "take_profit_1",
-            plan.get("tp1", plan.get("take_profit"))
-        )
-
-        if tp1 is None:
-            return None
-
-        entry = plan.get("entry_price")
-        stop = plan.get("stop_loss")
-
-        if entry is None or stop is None:
-            return None
-
-        plan["entry_price"] = entry
-        plan["stop_loss"] = stop
-        plan["take_profit"] = tp1
-        plan["take_profit_1"] = tp1
-
-        tp2 = plan.get(
-            "take_profit_2",
-            plan.get("tp2")
-        )
-
-        if tp2 is not None:
-            plan["take_profit_2"] = tp2
-
-        plan["direction"] = str(
-            candidate.get("direction", "")
-        ).upper()
-
-        plan["symbol"] = candidate.get("symbol")
-
-        return plan
-
-    @classmethod
-    def _normalize_candidate(cls, candidate):
-        """
-        將四策略排行榜格式轉成通知及資料庫格式。
-        """
-
-        if not isinstance(candidate, dict):
-            return None
-
-        strategy_name = str(
-            candidate.get(
-                "strategy_name",
-                candidate.get("strategy", "")
-            )
-        ).upper()
-
-        if strategy_name not in cls.STRATEGY_LISTS:
-            return None
-
-        direction = (
-            "LONG"
-            if strategy_name.startswith("LONG")
-            else "SHORT"
-        )
-
-        if str(
-            candidate.get("direction", "")
-        ).upper() != direction:
-            return None
-
-        score = cls._safe_float(
-            candidate.get("score")
-        )
-
-        if score is None or not 0 <= score <= 100:
-            return None
-
-        trade_plan = cls._normalize_trade_plan(
-            candidate
-        )
-
-        if trade_plan is None:
-            return None
-
-        symbol = candidate.get("symbol")
-
-        if not isinstance(symbol, str) or not symbol.strip():
-            return None
-
-        result = dict(candidate)
-
-        result["symbol"] = symbol.strip()
-        result["direction"] = direction
-        result["strategy_name"] = strategy_name
-        result["score"] = score
-        result["trade_plan"] = trade_plan
-
-        # Database.save_signal() 需要 strategy 字典。
-        result["strategy"] = {
-            "name": strategy_name,
-            "direction": direction,
-            "score": score,
-            "candidate": True
-        }
-
-        # 保留原始策略理由及交易計畫。
-        result["relative_strength"] = (
-            candidate.get("relative_strength")
-            if isinstance(
-                candidate.get("relative_strength"),
-                dict
-            )
-            else {}
-        )
-
-        return result
-
-    def _save_scan_history(self, scan_result):
-        """
-        保存每輪完整掃描結果。
-        """
+        method = getattr(self.database, "notification_exists", None)
+        if not callable(method):
+            return False
 
         try:
-            scan_id = self.database.save_scan(
-                scan_result
-            )
-
-            logger.info(
-                "Scan history saved: id=%s",
-                scan_id
-            )
-
-            return scan_id
-
+            return bool(method(notification_key))
         except Exception:
-            logger.exception(
-                "Failed to save scan history"
-            )
-
-            return None
-
-    def _save_signal_history(self, candidates):
-        """
-        保存四種策略的有效模擬交易訊號。
-        """
-
-        saved = 0
-        failed = 0
-
-        for candidate in candidates:
-            try:
-                normalized = self._normalize_candidate(
-                    candidate
-                )
-
-                if normalized is None:
-                    continue
-
-                signal_id = self.database.save_signal(
-                    normalized
-                )
-
-                if signal_id is not None:
-                    saved += 1
-
-            except Exception:
-                failed += 1
-
-                logger.exception(
-                    "Failed to save signal history: %s",
-                    candidate.get("symbol")
-                )
-
-        logger.info(
-            "Signal history: saved=%s failed=%s",
-            saved,
-            failed
-        )
-
-        return {
-            "saved": saved,
-            "failed": failed
-        }
+            logger.exception("查詢通知紀錄失敗")
+            return False
 
     def _record_notification(
         self,
         notification_key,
         candidate,
-        result
+        result,
     ):
-        """
-        保存 LINE 通知紀錄。
+        if self.database is None:
+            return
 
-        成功通知使用固定 key，供跨重啟防重複。
-        失敗通知使用獨立 key，避免失敗紀錄阻止下次重試。
-        """
+        method = getattr(self.database, "save_notification", None)
+        if not callable(method):
+            return
 
-        success = bool(
+        success = (
             isinstance(result, dict)
-            and result.get("success")
+            and result.get("success") is True
         )
 
-        status = (
-            "sent"
-            if success
-            else str(
-                result.get("status", "failed")
-                if isinstance(result, dict)
-                else "failed"
-            )
-        )
-
-        if success:
-            stored_key = notification_key
-        else:
-            stored_key = (
-                notification_key
-                + ":failed:"
-                + datetime.now(timezone.utc).strftime(
-                    "%Y%m%d%H%M%S%f"
-                )
-            )
+        status = "sent" if success else "failed"
 
         try:
-            self.database.save_notification(
-                notification_key=stored_key,
-                symbol=candidate.get("symbol"),
-                direction=candidate.get("direction"),
-                message=(
+            method(
+                notification_key=notification_key,
+                symbol=candidate.get("symbol", ""),
+                direction=candidate.get("direction", ""),
+                message=str(
                     result.get("message", "")
                     if isinstance(result, dict)
-                    else ""
+                    else result
                 ),
                 status=status,
                 error_message=(
-                    None if success else status
-                )
+                    None
+                    if success
+                    else str(
+                        result.get("error", "通知發送失敗")
+                        if isinstance(result, dict)
+                        else "通知發送失敗"
+                    )
+                ),
             )
-
         except Exception:
-            logger.exception(
-                "Failed to save notification history"
-            )
+            logger.exception("保存通知紀錄失敗")
 
-    def _send_candidate_notifications(self, candidates):
-        """
-        發送四種策略的獨立 LINE 訊號。
-        """
+    def _save_scan_history(self, scan_result):
+        if self.database is None:
+            return
 
-        sent = 0
-        skipped = 0
-        failed = 0
+        method = getattr(self.database, "save_scan", None)
+        if not callable(method):
+            return
+
+        try:
+            method(scan_result)
+        except Exception:
+            logger.exception("保存掃描紀錄失敗")
+
+    def _save_signal_history(self, candidates):
+        if self.database is None:
+            return
+
+        method = getattr(self.database, "save_signal", None)
+        if not callable(method):
+            return
 
         for candidate in candidates:
-            normalized = self._normalize_candidate(
-                candidate
-            )
+            try:
+                plan = candidate.get("trade_plan") or {}
+                strategy_name = self._get_strategy_name(candidate)
 
-            if normalized is None:
-                skipped += 1
+                direction = str(
+                    candidate.get("direction", "")
+                ).upper()
+
+                strategy_data = candidate.get("strategy")
+
+                if isinstance(strategy_data, dict):
+                    strategy_info = dict(strategy_data)
+                else:
+                    strategy_info = {
+                        "name": strategy_name,
+                        "direction": direction,
+                        "score": candidate.get(
+                            "score",
+                            candidate.get("strategy_score", 0),
+                        ),
+                    }
+
+                record = {
+                    "symbol": candidate.get("symbol"),
+                    "strategy": strategy_info,
+                    "trade_plan": plan,
+                    "relative_strength": (
+                        candidate.get("relative_strength") or {}
+                    ),
+                    "direction": direction,
+                }
+
+                method(record)
+
+            except Exception:
+                logger.exception(
+                    "保存訊號紀錄失敗：%s",
+                    candidate.get("symbol", "UNKNOWN"),
+                )
+
+    def _send_candidate_notifications(self, scan_result):
+        """
+        接受完整掃描結果 dict 或候選清單 list。
+        只發送有效的模擬訊號。
+        """
+        candidates = self._collect_candidates(scan_result)
+        notified = 0
+
+        for candidate in candidates:
+            if not self._is_simulation_candidate(candidate):
                 continue
 
-            notification_key = self._notification_key(
-                normalized
-            )
+            notification_key = self._notification_key(candidate)
+
+            if self._notification_exists(notification_key):
+                continue
 
             try:
-                # 使用資料庫檢查跨重啟重複訊號。
-                if self.database.notification_exists(
-                    notification_key
-                ):
-                    skipped += 1
-                    continue
-
-                result = self.notifier.send_signal(
-                    normalized
-                )
+                result = self.notifier.send_signal(candidate)
 
                 self._record_notification(
                     notification_key,
-                    normalized,
-                    result
+                    candidate,
+                    result,
                 )
 
                 if (
                     isinstance(result, dict)
-                    and result.get("success")
+                    and result.get("success") is True
                 ):
-                    sent += 1
-                else:
-                    failed += 1
-
-                    logger.warning(
-                        "LINE notification failed: %s %s",
-                        normalized.get("symbol"),
-                        (
-                            result.get("status")
-                            if isinstance(result, dict)
-                            else "unknown"
-                        )
-                    )
+                    notified += 1
 
             except Exception:
-                failed += 1
-
                 logger.exception(
-                    "Failed to process LINE notification: %s",
-                    normalized.get("symbol")
+                    "訊號通知失敗：%s",
+                    candidate.get("symbol", "UNKNOWN"),
                 )
 
-        summary = {
-            "sent": sent,
-            "skipped": skipped,
-            "failed": failed
+        return {
+            "candidate_count": len(candidates),
+            "notified_count": notified,
         }
 
-        logger.info(
-            "LINE signal notifications: %s",
-            summary
-        )
-
-        return summary
-
-    def _daily_summary_key(self, today):
-        return f"DAILY_SUMMARY:{today.isoformat()}"
-
     def _send_daily_summary_if_due(self, scan_result):
-        """
-        每天指定台灣時間發送一次摘要。
-        """
+        today = date.today()
+
+        if self._last_summary_date == today:
+            return
+
+        if datetime.now().hour < self.summary_hour:
+            return
+
+        notification_key = f"DAILY_SUMMARY:{today.isoformat()}"
+
+        if self._notification_exists(notification_key):
+            self._last_summary_date = today
+            return
 
         try:
-            now = datetime.now(
-                ZoneInfo(Config.TIMEZONE)
-            )
+            result = self.notifier.send_daily_summary(scan_result)
 
-            today = now.date()
-
-            if now.hour < self.summary_hour:
-                return {
-                    "success": False,
-                    "status": "not_due"
-                }
-
-            if self._last_summary_date == today:
-                return {
-                    "success": False,
-                    "status": "already_sent"
-                }
-
-            notification_key = self._daily_summary_key(
-                today
-            )
-
-            if self.database.notification_exists(
-                notification_key
+            if (
+                isinstance(result, dict)
+                and result.get("success") is True
             ):
                 self._last_summary_date = today
 
-                return {
-                    "success": False,
-                    "status": "already_sent"
-                }
-
-            result = self.notifier.send_daily_summary(
-                scan_result
-            )
-
-            if not isinstance(result, dict):
-                result = {
-                    "success": False,
-                    "status": "invalid_response"
-                }
-
-            if result.get("success"):
-                self._last_summary_date = today
-
-                self.database.save_notification(
-                    notification_key=notification_key,
-                    symbol="MARKET",
-                    direction="SUMMARY",
-                    message="Daily market summary",
-                    status="sent"
-                )
-
-            else:
-                failed_key = (
-                    notification_key
-                    + ":failed:"
-                    + datetime.now(timezone.utc).strftime(
-                        "%Y%m%d%H%M%S%f"
+                if self.database is not None:
+                    method = getattr(
+                        self.database,
+                        "save_notification",
+                        None,
                     )
-                )
 
-                self.database.save_notification(
-                    notification_key=failed_key,
-                    symbol="MARKET",
-                    direction="SUMMARY",
-                    message="Daily market summary",
-                    status=str(
-                        result.get("status", "failed")
-                    ),
-                    error_message=str(
-                        result.get("message", "Unknown error")
-                    )
-                )
-
-            return result
+                    if callable(method):
+                        try:
+                            method(
+                                notification_key=notification_key,
+                                symbol="SYSTEM",
+                                direction="SUMMARY",
+                                message="每日掃描摘要",
+                                status="sent",
+                            )
+                        except Exception:
+                            logger.exception("保存每日摘要紀錄失敗")
 
         except Exception:
-            logger.exception(
-                "Failed to send daily summary"
-            )
-
-            return {
-                "success": False,
-                "status": "error"
-            }
+            logger.exception("發送每日掃描摘要失敗")
 
     def run_once(self):
-        """
-        執行一次市場掃描。
-
-        如果上一輪掃描尚未完成，就不重複啟動。
-        """
-
         if not self._scan_lock.acquire(blocking=False):
             return {
                 "status": "skipped",
-                "reason": "Previous scan is still running",
-                "auto_trading": False
+                "reason": "scan_already_running",
+                "auto_trading": False,
             }
 
         try:
-            logger.info("Starting market scan")
+            scan_result = self.scanner.scan()
 
-            result = self.scanner.scan()
+            if not isinstance(scan_result, dict):
+                raise ValueError("scanner.scan() 必須回傳 dict")
 
-            if not isinstance(result, dict):
-                raise TypeError(
-                    "Scanner must return a dictionary"
-                )
+            self._last_scan_time = datetime.now(
+                timezone.utc
+            ).isoformat()
 
-            self._last_scan_result = result
+            self._last_scan_result = scan_result
+            self._last_error = None
 
-            # 不論掃描成功或失敗，都保存可追溯結果。
-            self._save_scan_history(result)
+            self._save_scan_history(scan_result)
 
-            if result.get("status") != "completed":
-                logger.warning(
-                    "Market scan did not complete: %s",
-                    result.get("error")
-                )
+            if scan_result.get("status") == "completed":
+                candidates = self._collect_candidates(scan_result)
 
-                return result
+                self._save_signal_history(candidates)
+                self._send_candidate_notifications(scan_result)
+                self._send_daily_summary_if_due(scan_result)
 
-            candidates = self._get_strategy_candidates(
-                result
-            )
+            return scan_result
 
-            signal_history = self._save_signal_history(
-                candidates
-            )
-
-            notification_result = (
-                self._send_candidate_notifications(
-                    candidates
-                )
-            )
-
-            summary_result = (
-                self._send_daily_summary_if_due(
-                    result
-                )
-            )
-
-            result["signal_history"] = signal_history
-            result["notification_result"] = (
-                notification_result
-            )
-            result["daily_summary_result"] = (
-                summary_result
-            )
-
-            logger.info(
-                "Market scan completed: scanned=%s "
-                "successful=%s failed=%s",
-                result.get("total_scanned", 0),
-                result.get("successful", 0),
-                result.get("failed", 0)
-            )
-
-            return result
-
-        except Exception:
-            logger.exception("Market scan failed")
+        except Exception as exc:
+            self._last_error = str(exc)
+            logger.exception("排程掃描發生錯誤")
 
             return {
                 "status": "error",
-                "reason": "Market scan execution failed",
+                "error": str(exc),
                 "auto_trading": False,
-                "trading_mode": "simulation_only"
+                "trading_mode": "simulation_only",
             }
 
         finally:
             self._scan_lock.release()
 
+    def _loop(self):
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                logger.exception("排程主迴圈發生錯誤")
+
+            self._stop_event.wait(self.interval_seconds)
+
+        with self._status_lock:
+            self._running = False
+
     def start(self):
-        """
-        啟動背景排程執行緒。
-        """
+        with self._status_lock:
+            if self._running:
+                return {
+                    "status": "already_running",
+                    "auto_trading": False,
+                }
 
-        if self.is_running:
-            return {
-                "status": "already_running",
-                "interval_seconds": self.interval_seconds
-            }
+            self._stop_event.clear()
+            self._running = True
 
-        self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="okx-trading-scheduler",
+                daemon=True,
+            )
 
-        self._thread = threading.Thread(
-            target=self._run_loop,
-            name="OKX-Market-Scheduler",
-            daemon=True
-        )
-
-        self._thread.start()
+            self._thread.start()
 
         return {
             "status": "started",
             "interval_seconds": self.interval_seconds,
-            "auto_trading": False
-        }
-
-    def _run_loop(self):
-        """
-        背景排程主迴圈。
-        """
-
-        while not self._stop_event.is_set():
-            self.run_once()
-
-            self._stop_event.wait(
-                self.interval_seconds
-            )
-
-    def stop(self, timeout=10):
-        """
-        停止背景排程。
-        """
-
-        self._stop_event.set()
-
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=timeout)
-
-        return {
-            "status": (
-                "stopped"
-                if not self.is_running
-                else "stopping"
-            ),
-            "auto_trading": False
-        }
-
-    def get_status(self):
-        """
-        取得排程及資料庫狀態。
-        """
-
-        try:
-            database_status = self.database.health_check()
-        except Exception:
-            database_status = {
-                "status": "error"
-            }
-
-        return {
-            "running": self.is_running,
-            "interval_seconds": self.interval_seconds,
-            "summary_hour": self.summary_hour,
-            "last_summary_date": (
-                self._last_summary_date.isoformat()
-                if self._last_summary_date
-                else None
-            ),
-            "last_scan_status": (
-                self._last_scan_result.get("status")
-                if self._last_scan_result
-                else None
-            ),
-            "database": database_status,
             "auto_trading": False,
-            "trading_mode": "simulation_only"
+            "trading_mode": "simulation_only",
+        }
+
+    def stop(self):
+        with self._status_lock:
+            if not self._running:
+                return {
+                    "status": "stopped",
+                    "auto_trading": False,
+                }
+
+            self._stop_event.set()
+            thread = self._thread
+
+        if thread and thread.is_alive():
+            thread.join(timeout=5)
+
+        with self._status_lock:
+            self._running = False
+
+        return {
+            "status": "stopped",
+            "auto_trading": False,
         }
