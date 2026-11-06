@@ -405,10 +405,16 @@ def api_status():
         "real_trading": False,
         "auto_trading": False,
         "line_configured": line_configured,
+
+        # 主要策略使用的進場週期
+        "timeframes": ["1H", "4H"],
+
+        # 高週期作為趨勢背景參考，並未刪除
+        "context_timeframes": ["1D", "1W"],
+
         "database_backend": getattr(
             Config, "DATABASE_BACKEND", "sqlite"
         ),
-        "timeframes": ["1H", "4H", "1D", "1W"],
         "strategies": [
             "LONG-A",
             "LONG-B",
