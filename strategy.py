@@ -11,23 +11,23 @@ except Exception:
 
 
 class StrategyEngine:
-    """OKX SMART TRADING V1.1 多空四策略訊號引擎。"""
+    """OKX SMART TRADING V1.2 多空四策略訊號引擎。"""
 
     TIMEFRAME_WEIGHTS = {"1H": 0.65, "4H": 0.35}
 
-    # 週期衝突扣分：確認突破策略比提前埋伏策略更嚴格
     TIMEFRAME_CONFLICT_PENALTY = {
-        "LONG-A": 5,
-        "LONG-B": 10,
-        "SHORT-A": 5,
-        "SHORT-B": 10,
+        "LONG-A": 10,
+        "LONG-B": 20,
+        "SHORT-A": 10,
+        "SHORT-B": 20,
     }
 
-    # 突破或跌破後，若偏離 EMA20 過遠，避免追價
     MAX_EXTENSION_ATR = {
         "LONG": 2.5,
         "SHORT": 2.5,
     }
+
+    MISSING_RS_SCORE_CAP = 69
 
     def __init__(self, min_score=None, breakout_lookback=20):
         self.min_score = (
@@ -40,9 +40,7 @@ class StrategyEngine:
     def _number(value, default=None):
         try:
             result = float(value)
-            if not math.isfinite(result):
-                return default
-            return result
+            return result if math.isfinite(result) else default
         except (TypeError, ValueError, OverflowError):
             return default
 
@@ -80,10 +78,8 @@ class StrategyEngine:
 
         for column in required:
             values = pd.to_numeric(df[column], errors="coerce")
-
             if values.iloc[-2:].isna().any():
                 return False
-
             if not all(math.isfinite(float(v)) for v in values.iloc[-2:]):
                 return False
 
@@ -92,16 +88,13 @@ class StrategyEngine:
         low = self._latest(df, "low")
         volume = self._latest(df, "volume")
 
-        if close is None or high is None or low is None or volume is None:
+        if None in (close, high, low, volume):
             return False
 
         if close <= 0 or high <= 0 or low <= 0 or volume < 0:
             return False
 
-        if high < low or close > high or close < low:
-            return False
-
-        return True
+        return high >= low and low <= close <= high
 
     def _common_features(self, df):
         values = {
@@ -124,12 +117,8 @@ class StrategyEngine:
             "volume_ma": self._latest(df, "volume_ma_20"),
             "high": self._latest(df, "high"),
             "low": self._latest(df, "low"),
-            "atr": self._latest(
-                df, "atr_14", self._latest(df, "atr")
-            ),
-            "supertrend_direction": self._latest(
-                df, "supertrend_direction"
-            ),
+            "atr": self._latest(df, "atr_14", self._latest(df, "atr")),
+            "supertrend_direction": self._latest(df, "supertrend_direction"),
             "obv": self._latest(df, "obv"),
             "bb_upper": self._latest(df, "bb_upper"),
             "bb_middle": self._latest(df, "bb_middle"),
@@ -138,10 +127,7 @@ class StrategyEngine:
         }
 
         values["previous_obv"] = self._previous(df, "obv")
-        values["previous_bb_bandwidth"] = self._previous(
-            df, "bb_bandwidth"
-        )
-
+        values["previous_bb_bandwidth"] = self._previous(df, "bb_bandwidth")
         return values
 
     @staticmethod
@@ -149,10 +135,9 @@ class StrategyEngine:
         required = [
             "close", "ema7", "ema20", "ema50",
             "rsi", "macd", "macd_signal", "macd_hist",
-            "adx", "plus_di", "minus_di",
+            "previous_hist", "adx", "plus_di", "minus_di",
             "volume", "volume_ma", "high", "low"
         ]
-
         return all(features.get(key) is not None for key in required)
 
     @staticmethod
@@ -166,15 +151,24 @@ class StrategyEngine:
             return 0, "BTC 相對強弱資料無效"
 
         if direction == "LONG":
+            if rs >= 1.0:
+                return 10, "相對 BTC 明顯強勢"
             if rs > 0:
-                return 10, "相對 BTC 強勢"
-            if rs < -2:
-                return -5, "相對 BTC 弱勢，扣分"
-        else:
+                return 5, "相對 BTC 小幅強勢"
+            if rs <= -2:
+                return -10, "相對 BTC 明顯弱勢"
             if rs < 0:
-                return 10, "相對 BTC 弱勢"
-            if rs > 2:
-                return -5, "相對 BTC 強勢，扣分"
+                return -5, "相對 BTC 弱勢"
+
+        else:
+            if rs <= -1.0:
+                return 10, "相對 BTC 明顯弱勢"
+            if rs < 0:
+                return 5, "相對 BTC 小幅弱勢"
+            if rs >= 2:
+                return -10, "相對 BTC 明顯強勢，不利做空"
+            if rs > 0:
+                return -5, "相對 BTC 強勢，不利做空"
 
         return 0, "相對 BTC 表現中性"
 
@@ -189,16 +183,11 @@ class StrategyEngine:
             (45 <= f["rsi"] <= 70, 10, "RSI 多頭區間"),
             (f["macd"] > f["macd_signal"], 10, "MACD 多頭排列"),
             (f["macd_hist"] > 0, 10, "MACD 柱體為正"),
-            (
-                f["macd_hist"] > f["previous_hist"],
-                5,
-                "MACD 動能增強"
-            ),
             (f["plus_di"] > f["minus_di"], 10, "DMI 多方占優"),
             (f["adx"] >= 20, 10, "ADX 趨勢強度足夠"),
             (
                 f["volume_ma"] > 0 and f["volume"] > f["volume_ma"],
-                5,
+                10,
                 "成交量高於均量"
             ),
         ]
@@ -212,9 +201,7 @@ class StrategyEngine:
             relative_strength, "LONG"
         )
         score += adjustment
-
-        if relative_strength is not None:
-            reasons.append(rs_reason)
+        reasons.append(rs_reason)
 
         return max(0, min(100, score)), reasons
 
@@ -229,16 +216,11 @@ class StrategyEngine:
             (30 <= f["rsi"] <= 55, 10, "RSI 空頭區間"),
             (f["macd"] < f["macd_signal"], 10, "MACD 空頭排列"),
             (f["macd_hist"] < 0, 10, "MACD 柱體為負"),
-            (
-                f["macd_hist"] < f["previous_hist"],
-                5,
-                "MACD 空頭動能增強"
-            ),
             (f["minus_di"] > f["plus_di"], 10, "DMI 空方占優"),
             (f["adx"] >= 20, 10, "ADX 趨勢強度足夠"),
             (
                 f["volume_ma"] > 0 and f["volume"] > f["volume_ma"],
-                5,
+                10,
                 "成交量高於均量"
             ),
         ]
@@ -252,9 +234,7 @@ class StrategyEngine:
             relative_strength, "SHORT"
         )
         score += adjustment
-
-        if relative_strength is not None:
-            reasons.append(rs_reason)
+        reasons.append(rs_reason)
 
         return max(0, min(100, score)), reasons
 
@@ -299,19 +279,12 @@ class StrategyEngine:
             and f["volume"] > f["volume_ma"]
         )
 
-        if not volume_confirmed:
+        if not volume_confirmed or f["close"] <= float(prior_high):
             return False
 
-        if f["close"] <= float(prior_high):
-            return False
-
-        # 避免突破後價格已遠離 EMA20，仍然追價。
         atr = f.get("atr")
-
         if atr is not None and atr > 0:
-            extension = (f["close"] - f["ema20"]) / atr
-
-            if extension > self.MAX_EXTENSION_ATR["LONG"]:
+            if (f["close"] - f["ema20"]) / atr > self.MAX_EXTENSION_ATR["LONG"]:
                 return False
 
         return (
@@ -353,19 +326,12 @@ class StrategyEngine:
             and f["volume"] > f["volume_ma"]
         )
 
-        if not volume_confirmed:
+        if not volume_confirmed or f["close"] >= float(prior_low):
             return False
 
-        if f["close"] >= float(prior_low):
-            return False
-
-        # 避免跌破後已遠離 EMA20，仍然追空。
         atr = f.get("atr")
-
         if atr is not None and atr > 0:
-            extension = (f["ema20"] - f["close"]) / atr
-
-            if extension > self.MAX_EXTENSION_ATR["SHORT"]:
+            if (f["ema20"] - f["close"]) / atr > self.MAX_EXTENSION_ATR["SHORT"]:
                 return False
 
         return (
@@ -384,48 +350,38 @@ class StrategyEngine:
 
         if st in (1, -1):
             if (
-                direction == "LONG" and st == 1
-            ) or (
-                direction == "SHORT" and st == -1
+                (direction == "LONG" and st == 1)
+                or (direction == "SHORT" and st == -1)
             ):
                 points += 5
                 reasons.append("Supertrend 方向確認")
             else:
-                points -= 5
-                reasons.append("Supertrend 與訊號方向衝突")
+                points -= 10
+                reasons.append("Supertrend 與訊號方向衝突，扣分")
 
         obv = f.get("obv")
         prev_obv = f.get("previous_obv")
 
         if obv is not None and prev_obv is not None:
             if (
-                direction == "LONG" and obv > prev_obv
-            ) or (
-                direction == "SHORT" and obv < prev_obv
+                (direction == "LONG" and obv > prev_obv)
+                or (direction == "SHORT" and obv < prev_obv)
             ):
                 points += 3
                 reasons.append("OBV 方向配合")
             else:
-                points -= 2
+                points -= 3
                 reasons.append("OBV 未配合訊號方向")
 
-        if (
-            f.get("bb_upper") is not None
-            and f.get("bb_lower") is not None
-            and f.get("bb_middle") is not None
+        if all(
+            f.get(key) is not None
+            for key in ("bb_upper", "bb_lower", "bb_middle")
         ):
             if f["bb_upper"] > f["bb_lower"]:
-                if (
-                    direction == "LONG"
-                    and f["close"] > f["bb_middle"]
-                ):
+                if direction == "LONG" and f["close"] > f["bb_middle"]:
                     points += 2
                     reasons.append("布林中軌偏多")
-
-                elif (
-                    direction == "SHORT"
-                    and f["close"] < f["bb_middle"]
-                ):
+                elif direction == "SHORT" and f["close"] < f["bb_middle"]:
                     points += 2
                     reasons.append("布林中軌偏空")
 
@@ -433,12 +389,10 @@ class StrategyEngine:
 
     @staticmethod
     def _timeframe_state(f):
-        """使用 EMA 與 DMI 判斷單一週期方向。"""
         bullish = (
             f["ema7"] > f["ema20"]
             and f["plus_di"] > f["minus_di"]
         )
-
         bearish = (
             f["ema7"] < f["ema20"]
             and f["minus_di"] > f["plus_di"]
@@ -446,28 +400,28 @@ class StrategyEngine:
 
         if bullish:
             return "LONG"
-
         if bearish:
             return "SHORT"
-
         return "NEUTRAL"
 
     def _timeframe_conflict(self, f1, f4, direction, strategy):
         state_1h = self._timeframe_state(f1)
         state_4h = self._timeframe_state(f4)
 
+        penalty = self.TIMEFRAME_CONFLICT_PENALTY.get(strategy, 10)
+
+        if state_1h == direction and state_4h == direction:
+            return 0, ["1H／4H 方向一致"]
+
         if state_1h == "NEUTRAL" or state_4h == "NEUTRAL":
-            return 0, []
+            return 0, [
+                f"週期確認不足（1H={state_1h}、4H={state_4h}）"
+            ]
 
-        if state_1h == state_4h:
-            if state_1h == direction:
-                return 0, ["1H／4H 方向一致"]
-
-            return 0, ["1H／4H 同向，但與策略方向相反"]
-
-        penalty = self.TIMEFRAME_CONFLICT_PENALTY.get(
-            strategy, 5
-        )
+        if state_1h == state_4h and state_1h != direction:
+            return -penalty, [
+                f"1H／4H 均與策略方向相反，扣 {penalty} 分"
+            ]
 
         return -penalty, [
             f"1H／4H 趨勢衝突（1H={state_1h}、4H={state_4h}），扣 {penalty} 分"
@@ -528,9 +482,11 @@ class StrategyEngine:
         strategy,
         fib_context,
         timeframe_penalty=0,
-        timeframe_reasons=None
+        timeframe_reasons=None,
+        relative_strength_missing=False
     ):
-        score = base_score
+        # 基礎分數縮放，保留額外確認項目的空間。
+        score = base_score * 0.80
         reasons = []
 
         optional_points, optional_reasons = (
@@ -544,25 +500,13 @@ class StrategyEngine:
 
             if convergence is not None and convergence <= 1.5:
                 score += 5
-                reasons.append("EMA20/50/7 高度收斂")
+                reasons.append("EMA 均線高度收斂")
 
             elif convergence is not None and convergence > 3:
                 score -= 5
                 reasons.append("均線未收斂，提前埋伏條件較弱")
 
-            if (
-                direction == "LONG"
-                and f["macd_hist"] > f["previous_hist"]
-            ):
-                score += 3
-                reasons.append("多方動能改善")
-
-            elif (
-                direction == "SHORT"
-                and f["macd_hist"] < f["previous_hist"]
-            ):
-                score += 3
-                reasons.append("空方動能改善")
+            # MACD 動能已在基礎評分，不再重複加分。
 
         else:
             volume_ok = (
@@ -572,14 +516,11 @@ class StrategyEngine:
             )
 
             if volume_ok:
-                score += 5
+                score += 3
                 reasons.append("突破／跌破成交量確認")
-            else:
-                score -= 5
-                reasons.append("成交量未確認突破／跌破")
 
         if fib_context:
-            score += 5
+            score += 3
             reasons.append(
                 f"接近 Fibonacci {fib_context['level']} "
                 f"（距離 {fib_context['distance_pct']:.2f}%）"
@@ -589,6 +530,12 @@ class StrategyEngine:
 
         if timeframe_reasons:
             reasons.extend(timeframe_reasons)
+
+        if relative_strength_missing:
+            score = min(score, self.MISSING_RS_SCORE_CAP)
+            reasons.append(
+                "BTC 相對強弱資料不完整，分數上限 69"
+            )
 
         return max(0, min(100, round(score))), reasons
 
@@ -608,41 +555,21 @@ class StrategyEngine:
         relative_strength_4h=None
     ):
         if not self._validate(df_1h):
-            return self._empty_result(
-                inst_id,
-                "1H資料不足或欄位不完整"
-            )
+            return self._empty_result(inst_id, "1H資料不足或欄位不完整")
 
         if not self._validate(df_4h):
-            return self._empty_result(
-                inst_id,
-                "4H資料不足或欄位不完整"
-            )
+            return self._empty_result(inst_id, "4H資料不足或欄位不完整")
 
         f1 = self._common_features(df_1h)
         f4 = self._common_features(df_4h)
 
-        if (
-            not self._valid_features(f1)
-            or not self._valid_features(f4)
-        ):
-            return self._empty_result(
-                inst_id,
-                "技術指標尚未形成"
-            )
+        if not self._valid_features(f1) or not self._valid_features(f4):
+            return self._empty_result(inst_id, "技術指標尚未形成")
 
-        long_1h, long_reasons = self._score_long(
-            f1, relative_strength_1h
-        )
-        short_1h, short_reasons = self._score_short(
-            f1, relative_strength_1h
-        )
-        long_4h, long_4h_reasons = self._score_long(
-            f4, relative_strength_4h
-        )
-        short_4h, short_4h_reasons = self._score_short(
-            f4, relative_strength_4h
-        )
+        long_1h, long_reasons = self._score_long(f1, relative_strength_1h)
+        short_1h, short_reasons = self._score_short(f1, relative_strength_1h)
+        long_4h, long_4h_reasons = self._score_long(f4, relative_strength_4h)
+        short_4h, short_4h_reasons = self._score_short(f4, relative_strength_4h)
 
         long_score = self._weighted_score(long_1h, long_4h)
         short_score = self._weighted_score(short_1h, short_4h)
@@ -650,42 +577,40 @@ class StrategyEngine:
         fib_long = self._fibonacci_context(df_4h, "LONG")
         fib_short = self._fibonacci_context(df_4h, "SHORT")
 
-        long_a_penalty, long_a_conflict = (
-            self._timeframe_conflict(
-                f1, f4, "LONG", "LONG-A"
-            )
+        long_a_penalty, long_a_conflict = self._timeframe_conflict(
+            f1, f4, "LONG", "LONG-A"
         )
-        long_b_penalty, long_b_conflict = (
-            self._timeframe_conflict(
-                f1, f4, "LONG", "LONG-B"
-            )
+        long_b_penalty, long_b_conflict = self._timeframe_conflict(
+            f1, f4, "LONG", "LONG-B"
         )
-        short_a_penalty, short_a_conflict = (
-            self._timeframe_conflict(
-                f1, f4, "SHORT", "SHORT-A"
-            )
+        short_a_penalty, short_a_conflict = self._timeframe_conflict(
+            f1, f4, "SHORT", "SHORT-A"
         )
-        short_b_penalty, short_b_conflict = (
-            self._timeframe_conflict(
-                f1, f4, "SHORT", "SHORT-B"
-            )
+        short_b_penalty, short_b_conflict = self._timeframe_conflict(
+            f1, f4, "SHORT", "SHORT-B"
         )
+
+        rs_long_missing = (
+            relative_strength_1h is None
+            or relative_strength_4h is None
+        )
+        rs_short_missing = rs_long_missing
 
         long_a_score, long_a_extra = self._strategy_score(
             long_score, f1, "LONG", "LONG-A", fib_long,
-            long_a_penalty, long_a_conflict
+            long_a_penalty, long_a_conflict, rs_long_missing
         )
         long_b_score, long_b_extra = self._strategy_score(
             long_score, f1, "LONG", "LONG-B", fib_long,
-            long_b_penalty, long_b_conflict
+            long_b_penalty, long_b_conflict, rs_long_missing
         )
         short_a_score, short_a_extra = self._strategy_score(
             short_score, f1, "SHORT", "SHORT-A", fib_short,
-            short_a_penalty, short_a_conflict
+            short_a_penalty, short_a_conflict, rs_short_missing
         )
         short_b_score, short_b_extra = self._strategy_score(
             short_score, f1, "SHORT", "SHORT-B", fib_short,
-            short_b_penalty, short_b_conflict
+            short_b_penalty, short_b_conflict, rs_short_missing
         )
 
         candidates = []
@@ -747,18 +672,16 @@ class StrategyEngine:
                 "status": "simulation_only"
             })
 
-        strategy_scores = {
-            "LONG-A": long_a_score,
-            "LONG-B": long_b_score,
-            "SHORT-A": short_a_score,
-            "SHORT-B": short_b_score
-        }
-
         return {
             "symbol": inst_id,
             "long_score": long_score,
             "short_score": short_score,
-            "strategy_scores": strategy_scores,
+            "strategy_scores": {
+                "LONG-A": long_a_score,
+                "LONG-B": long_b_score,
+                "SHORT-A": short_a_score,
+                "SHORT-B": short_b_score
+            },
             "signals": signals,
             "status": "simulation_only"
         }
