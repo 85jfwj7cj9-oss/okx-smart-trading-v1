@@ -12,13 +12,6 @@ class MarketScanner:
     OKX SMART TRADING V1.0
 
     USDT 永續合約市場掃描器。
-
-    支援：
-    - LONG-A 提前埋伏做多
-    - LONG-B 突破確認做多
-    - SHORT-A 提前埋伏做空
-    - SHORT-B 跌破確認做空
-
     僅分析行情與模擬交易訊號，不執行真實下單。
     """
 
@@ -42,14 +35,9 @@ class MarketScanner:
             market_data=self.market_data
         )
 
-        self.max_symbols = max(
-            1,
-            min(int(max_symbols), 100)
-        )
+        self.max_symbols = max(1, min(int(max_symbols), 100))
 
-        self.min_relative_strength = float(
-            min_relative_strength
-        )
+        self.min_relative_strength = float(min_relative_strength)
 
         if not math.isfinite(self.min_relative_strength):
             raise ValueError(
@@ -76,7 +64,7 @@ class MarketScanner:
         strategy = result.get("strategy") or {}
 
         if not isinstance(strategy, dict):
-            strategy = {}
+            return 0.0
 
         for key in ("score", "signal_score", "total_score"):
             value = cls._safe_float(strategy.get(key))
@@ -127,10 +115,32 @@ class MarketScanner:
 
     @classmethod
     def _get_relative_strength(cls, result):
+        """
+        讀取 1H、4H BTC 相對強弱。
+
+        新格式：
+        {
+            "1H": {
+                "relative_strength_pct": 2.5
+            },
+            "4H": {
+                "relative_strength_pct": 4.2
+            }
+        }
+
+        舊格式：
+        {
+            "1H": 2.5,
+            "4H": 4.2
+        }
+
+        缺少任一週期資料時回傳 None。
+        """
+
         if not isinstance(result, dict):
             return None
 
-        relative = result.get("relative_strength") or {}
+        relative = result.get("relative_strength")
 
         if not isinstance(relative, dict):
             return None
@@ -138,9 +148,15 @@ class MarketScanner:
         values = []
 
         for timeframe in ("1H", "4H"):
-            value = cls._safe_float(
-                relative.get(timeframe)
-            )
+            item = relative.get(timeframe)
+
+            if isinstance(item, dict):
+                value = cls._safe_float(
+                    item.get("relative_strength_pct")
+                )
+            else:
+                # 相容舊版純數字資料。
+                value = cls._safe_float(item)
 
             if value is None:
                 return None
@@ -168,7 +184,7 @@ class MarketScanner:
             if not isinstance(inst_id, str):
                 continue
 
-            inst_id = inst_id.strip()
+            inst_id = inst_id.strip().upper()
 
             if not inst_id.endswith("-USDT-SWAP"):
                 continue
@@ -186,17 +202,13 @@ class MarketScanner:
             limit=self.max_symbols
         )
 
-        symbols = self._get_symbols_from_rows(
-            market_rows
-        )
+        symbols = self._get_symbols_from_rows(market_rows)
 
         return symbols[:self.max_symbols]
 
     @staticmethod
     def _timestamp():
-        return datetime.now(
-            timezone.utc
-        ).isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def _error_result(self, symbol, exc):
         return {
@@ -234,13 +246,6 @@ class MarketScanner:
 
     @classmethod
     def _build_strategy_candidate(cls, item, signal):
-        """
-        建立單一策略排行榜資料。
-
-        每個訊號使用自己的分數及交易計畫，
-        不使用其他策略的交易計畫。
-        """
-
         if not isinstance(signal, dict):
             return None
 
@@ -252,9 +257,7 @@ class MarketScanner:
             return None
 
         expected_direction = (
-            "LONG"
-            if name.startswith("LONG")
-            else "SHORT"
+            "LONG" if name.startswith("LONG") else "SHORT"
         )
 
         direction = str(
@@ -264,16 +267,12 @@ class MarketScanner:
         if direction != expected_direction:
             return None
 
-        score = cls._safe_float(
-            signal.get("score")
-        )
+        score = cls._safe_float(signal.get("score"))
 
         if score is None or not 0 <= score <= 100:
             return None
 
-        price = cls._safe_float(
-            signal.get("price")
-        )
+        price = cls._safe_float(signal.get("price"))
 
         if price is not None and price <= 0:
             price = None
@@ -345,13 +344,6 @@ class MarketScanner:
         return candidates
 
     def scan(self, equity=None):
-        """
-        執行一輪市場掃描。
-
-        每個幣種獨立處理。
-        單一幣種失敗不會中斷整輪掃描。
-        """
-
         started_at = self._timestamp()
 
         empty_lists = self._empty_strategy_lists()
@@ -463,9 +455,7 @@ class MarketScanner:
             candidate = self._get_candidate(item)
             score = self._get_score(item)
 
-            relative_strength = (
-                self._get_relative_strength(item)
-            )
+            relative_strength = self._get_relative_strength(item)
 
             item["direction"] = direction
             item["score"] = score
@@ -473,22 +463,19 @@ class MarketScanner:
                 relative_strength
             )
 
+            # 缺少相對強弱資料的幣種不進入強勢排行榜。
             if (
                 relative_strength is not None
-                and relative_strength
-                >= self.min_relative_strength
+                and relative_strength >= self.min_relative_strength
             ):
                 strong_coins.append(item)
 
-            # 保留舊版 LONG / SHORT 總排行榜。
             if candidate:
                 if direction == "LONG":
                     long_candidates.append(item)
-
                 elif direction == "SHORT":
                     short_candidates.append(item)
 
-            # 新版：四種策略獨立排行榜。
             signals = self._get_strategy_signals(item)
 
             for signal in signals:
@@ -502,9 +489,7 @@ class MarketScanner:
                 if strategy_candidate is None:
                     continue
 
-                strategy_name = (
-                    strategy_candidate["strategy"]
-                )
+                strategy_name = strategy_candidate["strategy"]
 
                 strategy_lists[strategy_name].append(
                     strategy_candidate
@@ -522,9 +507,8 @@ class MarketScanner:
 
         strong_coins.sort(
             key=lambda item: (
-                item.get(
-                    "average_relative_strength_pct"
-                ) or 0
+                item["average_relative_strength_pct"],
+                item.get("score", 0)
             ),
             reverse=True
         )
