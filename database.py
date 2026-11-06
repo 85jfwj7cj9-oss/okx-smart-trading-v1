@@ -1,5 +1,6 @@
 
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 
 class Database:
     """
-    OKX SMART TRADING V1.0
+    OKX SMART TRADING V1.1
     SQLite 資料庫管理模組。
 
     僅保存行情分析及模擬交易資料。
@@ -21,7 +22,6 @@ class Database:
             database_path
             or os.getenv("DATABASE_PATH", "data/okx_trading.db")
         )
-
         self._lock = threading.RLock()
 
         if self.database_path != ":memory:":
@@ -36,6 +36,30 @@ class Database:
     def _now():
         return datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def _json(data):
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False
+        )
+
+    @staticmethod
+    def _number(value, name, positive=False):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be numeric")
+
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be finite")
+
+        if positive and number <= 0:
+            raise ValueError(f"{name} must be positive")
+
+        return number
+
     def _connect(self):
         connection = sqlite3.connect(
             self.database_path,
@@ -46,8 +70,23 @@ class Database:
         connection.execute("PRAGMA busy_timeout = 15000")
         return connection
 
+    def _ensure_columns(self, connection, table, columns):
+        existing = {
+            row["name"]
+            for row in connection.execute(
+                f"PRAGMA table_info({table})"
+            ).fetchall()
+        }
+
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN "
+                    f"{name} {definition}"
+                )
+
     def initialize(self):
-        """建立資料表及索引。"""
+        """建立資料表、索引及安全升級舊版欄位。"""
 
         statements = [
             """
@@ -113,31 +152,56 @@ class Database:
             """
         ]
 
-        indexes = [
-            """
-            CREATE INDEX IF NOT EXISTS idx_scan_time
-            ON scan_history(scan_time)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_signal_symbol
-            ON signal_history(symbol)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_signal_time
-            ON signal_history(signal_time)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_trade_status
-            ON simulated_trades(status)
-            """
-        ]
-
         with self._lock:
             connection = self._connect()
             try:
                 with connection:
                     for statement in statements:
                         connection.execute(statement)
+
+                    self._ensure_columns(
+                        connection,
+                        "signal_history",
+                        {
+                            "take_profit_1": "REAL",
+                            "take_profit_2": "REAL"
+                        }
+                    )
+
+                    self._ensure_columns(
+                        connection,
+                        "simulated_trades",
+                        {
+                            "take_profit_1": "REAL",
+                            "take_profit_2": "REAL",
+                            "fees_usdt": "REAL DEFAULT 0",
+                            "slippage_usdt": "REAL DEFAULT 0",
+                            "net_pnl_usdt": "REAL"
+                        }
+                    )
+
+                    indexes = [
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_scan_time
+                        ON scan_history(scan_time)
+                        """,
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_signal_symbol
+                        ON signal_history(symbol)
+                        """,
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_signal_time
+                        ON signal_history(signal_time)
+                        """,
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_trade_status
+                        ON simulated_trades(status)
+                        """,
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_trade_symbol
+                        ON simulated_trades(symbol)
+                        """
+                    ]
 
                     for statement in indexes:
                         connection.execute(statement)
@@ -175,11 +239,7 @@ class Database:
         if not isinstance(result, dict):
             raise ValueError("result must be a dictionary")
 
-        result_json = json.dumps(
-            result,
-            ensure_ascii=False,
-            default=str
-        )
+        result_json = self._json(result)
 
         return self._execute_insert(
             """
@@ -198,13 +258,13 @@ class Database:
             """,
             (
                 result.get("finished_at", self._now()),
-                result.get("total_scanned", 0),
-                result.get("successful", 0),
-                result.get("failed", 0),
-                result.get("long_count", 0),
-                result.get("short_count", 0),
-                result.get("strong_coin_count", 0),
-                result.get("status", "unknown"),
+                int(result.get("total_scanned", 0)),
+                int(result.get("successful", 0)),
+                int(result.get("failed", 0)),
+                int(result.get("long_count", 0)),
+                int(result.get("short_count", 0)),
+                int(result.get("strong_coin_count", 0)),
+                str(result.get("status", "unknown")),
                 result_json
             )
         )
@@ -237,42 +297,76 @@ class Database:
         if plan.get("status") != "simulation_only":
             raise ValueError("Only simulation plans can be saved")
 
-        prices = [
-            plan.get("entry_price"),
-            plan.get("stop_loss"),
-            plan.get("take_profit")
-        ]
+        entry = self._number(
+            plan.get("entry_price"), "entry_price", True
+        )
+        stop = self._number(
+            plan.get("stop_loss"), "stop_loss", True
+        )
 
-        if any(value is None for value in prices):
+        tp1 = plan.get(
+            "take_profit_1",
+            plan.get("tp1", plan.get("take_profit"))
+        )
+        tp2 = plan.get(
+            "take_profit_2",
+            plan.get("tp2")
+        )
+
+        if tp1 is None:
             raise ValueError("Trade plan prices are incomplete")
+
+        tp1 = self._number(tp1, "take_profit_1", True)
+
+        if tp2 is not None:
+            tp2 = self._number(tp2, "take_profit_2", True)
+
+        if direction == "LONG":
+            if not stop < entry < tp1:
+                raise ValueError("Invalid LONG price levels")
+            if tp2 is not None and tp2 <= tp1:
+                raise ValueError("Invalid LONG TP2")
+        else:
+            if not tp1 < entry < stop:
+                raise ValueError("Invalid SHORT price levels")
+            if tp2 is not None and tp2 >= tp1:
+                raise ValueError("Invalid SHORT TP2")
+
+        score = self._number(
+            strategy.get(
+                "score",
+                strategy.get("signal_score", 0)
+            ),
+            "score"
+        )
+
+        result_json = self._json(result)
 
         return self._execute_insert(
             """
             INSERT INTO signal_history (
                 symbol, direction, score,
                 entry_price, stop_loss, take_profit,
+                take_profit_1, take_profit_2,
                 relative_strength_1h, relative_strength_4h,
                 signal_time, status, result_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 result.get("symbol", "UNKNOWN"),
                 direction,
-                strategy.get(
-                    "score",
-                    strategy.get("signal_score", 0)
-                ),
-                *prices,
+                score,
+                entry,
+                stop,
+                tp1,
+                tp1,
+                tp2,
                 relative.get("1H"),
                 relative.get("4H"),
                 self._now(),
                 "observing",
-                json.dumps(
-                    result,
-                    ensure_ascii=False,
-                    default=str
-                )
+                result_json
             )
         )
 
@@ -313,8 +407,6 @@ class Database:
             return None
 
     def notification_exists(self, notification_key):
-        """檢查通知紀錄是否存在。"""
-
         row = self._fetch_one(
             """
             SELECT id FROM notification_history
@@ -339,7 +431,9 @@ class Database:
             raise ValueError("Invalid position data")
 
         symbol = trade_plan.get("symbol")
-        direction = trade_plan.get("direction")
+        direction = str(
+            trade_plan.get("direction", "")
+        ).upper()
 
         if not symbol:
             raise ValueError("symbol is required")
@@ -348,38 +442,72 @@ class Database:
             raise ValueError("Invalid trade direction")
 
         try:
-            entry = float(trade_plan["entry_price"])
-            stop = float(trade_plan["stop_loss"])
-            target = float(trade_plan["take_profit"])
-            quantity = float(position["quantity"])
-            notional = float(position["notional_usdt"])
-            leverage = float(position["leverage"])
-        except (KeyError, TypeError, ValueError):
+            entry = self._number(
+                trade_plan["entry_price"], "entry_price", True
+            )
+            stop = self._number(
+                trade_plan["stop_loss"], "stop_loss", True
+            )
+            target = self._number(
+                trade_plan.get(
+                    "take_profit_1",
+                    trade_plan.get("tp1", trade_plan.get("take_profit"))
+                ),
+                "take_profit_1",
+                True
+            )
+            tp2_value = trade_plan.get(
+                "take_profit_2",
+                trade_plan.get("tp2")
+            )
+            tp2 = (
+                self._number(tp2_value, "take_profit_2", True)
+                if tp2_value is not None else None
+            )
+            quantity = self._number(
+                position["quantity"], "quantity", True
+            )
+            notional = self._number(
+                position["notional_usdt"], "notional_usdt", True
+            )
+            leverage = self._number(
+                position["leverage"], "leverage", True
+            )
+        except (KeyError, TypeError):
             raise ValueError("Invalid trade plan values")
 
-        values = [
-            entry, stop, target,
-            quantity, notional, leverage
-        ]
+        if direction == "LONG":
+            if not stop < entry < target:
+                raise ValueError("Invalid LONG price levels")
+            if tp2 is not None and tp2 <= target:
+                raise ValueError("Invalid LONG TP2")
+        else:
+            if not target < entry < stop:
+                raise ValueError("Invalid SHORT price levels")
+            if tp2 is not None and tp2 >= target:
+                raise ValueError("Invalid SHORT TP2")
 
-        if any(value <= 0 for value in values):
-            raise ValueError("Trade values must be positive")
+        fees = self._number(
+            trade_plan.get("fees_usdt", 0), "fees_usdt"
+        )
+        slippage = self._number(
+            trade_plan.get("slippage_usdt", 0), "slippage_usdt"
+        )
 
-        if direction == "LONG" and not stop < entry < target:
-            raise ValueError("Invalid LONG price levels")
-
-        if direction == "SHORT" and not target < entry < stop:
-            raise ValueError("Invalid SHORT price levels")
+        if fees < 0 or slippage < 0:
+            raise ValueError("Fees and slippage cannot be negative")
 
         return self._execute_insert(
             """
             INSERT INTO simulated_trades (
                 symbol, direction, entry_price,
-                stop_loss, take_profit, quantity,
-                notional_usdt, leverage, entry_time,
-                status, result_json
+                stop_loss, take_profit,
+                take_profit_1, take_profit_2,
+                quantity, notional_usdt, leverage,
+                entry_time, status, result_json,
+                fees_usdt, slippage_usdt
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -387,29 +515,29 @@ class Database:
                 entry,
                 stop,
                 target,
+                target,
+                tp2,
                 quantity,
                 notional,
                 leverage,
                 self._now(),
                 "open",
-                json.dumps(
-                    trade_plan,
-                    ensure_ascii=False,
-                    default=str
-                )
+                self._json(trade_plan),
+                fees,
+                slippage
             )
         )
 
     def close_simulated_trade(self, trade_id, exit_price):
-        """結束模擬交易，計算未扣手續費及滑價的毛損益。"""
+        """
+        結束模擬交易。
+        pnl_usdt 為毛損益；
+        net_pnl_usdt 扣除已設定的費用及滑價估算。
+        """
 
-        try:
-            exit_price = float(exit_price)
-        except (TypeError, ValueError):
-            raise ValueError("exit_price must be numeric")
-
-        if exit_price <= 0:
-            raise ValueError("exit_price must be positive")
+        exit_price = self._number(
+            exit_price, "exit_price", True
+        )
 
         with self._lock:
             connection = self._connect()
@@ -437,12 +565,17 @@ class Database:
                     else:
                         raise ValueError("Invalid stored direction")
 
+                    fees = row["fees_usdt"] or 0
+                    slippage = row["slippage_usdt"] or 0
+                    net_pnl = pnl - fees - slippage
+
                     connection.execute(
                         """
                         UPDATE simulated_trades
                         SET exit_price = ?,
                             exit_time = ?,
                             pnl_usdt = ?,
+                            net_pnl_usdt = ?,
                             status = 'closed'
                         WHERE id = ?
                         """,
@@ -450,6 +583,7 @@ class Database:
                             exit_price,
                             self._now(),
                             pnl,
+                            net_pnl,
                             trade_id
                         )
                     )
@@ -460,7 +594,6 @@ class Database:
 
     def get_scan_history(self, limit=50):
         limit = max(1, min(int(limit), 500))
-
         return self._fetch_all(
             """
             SELECT * FROM scan_history
@@ -471,7 +604,6 @@ class Database:
 
     def get_signal_history(self, limit=50):
         limit = max(1, min(int(limit), 500))
-
         return self._fetch_all(
             """
             SELECT * FROM signal_history
@@ -502,7 +634,7 @@ class Database:
         )
 
     def get_trade_statistics(self):
-        """取得模擬交易統計。"""
+        """取得模擬交易統計，不代表真實交易績效。"""
 
         row = self._fetch_one(
             """
@@ -516,7 +648,8 @@ class Database:
                     AS winning_trades,
                 SUM(CASE WHEN pnl_usdt < 0 THEN 1 ELSE 0 END)
                     AS losing_trades,
-                COALESCE(SUM(pnl_usdt), 0) AS gross_pnl_usdt
+                COALESCE(SUM(pnl_usdt), 0) AS gross_pnl_usdt,
+                COALESCE(SUM(net_pnl_usdt), 0) AS net_pnl_usdt
             FROM simulated_trades
             """
         ) or {}
@@ -533,6 +666,9 @@ class Database:
             "gross_pnl_usdt": round(
                 row.get("gross_pnl_usdt") or 0, 4
             ),
+            "net_pnl_usdt": round(
+                row.get("net_pnl_usdt") or 0, 4
+            ),
             "win_rate_percent": round(
                 wins / closed * 100, 2
             ) if closed else 0,
@@ -544,7 +680,6 @@ class Database:
 
         try:
             row = self._fetch_one("SELECT 1 AS result")
-
             return {
                 "status": (
                     "ok"
