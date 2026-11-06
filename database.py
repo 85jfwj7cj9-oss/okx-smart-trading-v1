@@ -17,7 +17,7 @@ except ImportError:
 
 class Database:
     """
-    OKX SMART TRADING V1.2
+    OKX SMART TRADING V1.2.1
 
     支援：
     - SQLite：本機及 GitHub Actions 測試
@@ -29,7 +29,6 @@ class Database:
 
     def __init__(self, database_path=None):
         self._lock = threading.RLock()
-
         self.database_url = ""
         self.database_path = None
 
@@ -126,7 +125,16 @@ class Database:
             self.database_path,
             timeout=15
         )
-        connection.row_factory = sqlite3.Row
+
+        # 修正 SQLite Row 不支援 get() 的問題。
+        # 讓 SQLite 與 PostgreSQL 都回傳字典格式。
+        connection.row_factory = (
+            lambda cursor, row: {
+                column[0]: row[index]
+                for index, column in enumerate(cursor.description)
+            }
+        )
+
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 15000")
 
@@ -279,6 +287,7 @@ class Database:
                 net_pnl_usdt REAL
             )
             """
+
         ]
 
     def _ensure_columns(self, connection, table, columns):
@@ -338,27 +347,19 @@ class Database:
                     for statement in self._table_statements():
                         connection.execute(statement)
 
-                    self._ensure_columns(
-                        connection,
-                        "signal_history",
-                        {
-                            "take_profit_1": (
-                                "DOUBLE PRECISION"
-                                if self.backend == "postgresql"
-                                else "REAL"
-                            ),
-                            "take_profit_2": (
-                                "DOUBLE PRECISION"
-                                if self.backend == "postgresql"
-                                else "REAL"
-                            )
-                        }
-                    )
-
                     numeric_type = (
                         "DOUBLE PRECISION"
                         if self.backend == "postgresql"
                         else "REAL"
+                    )
+
+                    self._ensure_columns(
+                        connection,
+                        "signal_history",
+                        {
+                            "take_profit_1": numeric_type,
+                            "take_profit_2": numeric_type
+                        }
                     )
 
                     self._ensure_columns(
@@ -761,6 +762,7 @@ class Database:
                             "Invalid stored direction"
                         )
 
+                    # SQLite 與 PostgreSQL 現在都使用 dict row。
                     fees = row.get("fees_usdt", 0) or 0
                     slippage = row.get("slippage_usdt", 0) or 0
                     net_pnl = pnl - fees - slippage
