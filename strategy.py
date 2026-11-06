@@ -11,9 +11,23 @@ except Exception:
 
 
 class StrategyEngine:
-    """OKX SMART TRADING V1.0 多空四策略訊號引擎。"""
+    """OKX SMART TRADING V1.1 多空四策略訊號引擎。"""
 
     TIMEFRAME_WEIGHTS = {"1H": 0.65, "4H": 0.35}
+
+    # 週期衝突扣分：確認突破策略比提前埋伏策略更嚴格
+    TIMEFRAME_CONFLICT_PENALTY = {
+        "LONG-A": 5,
+        "LONG-B": 10,
+        "SHORT-A": 5,
+        "SHORT-B": 10,
+    }
+
+    # 突破或跌破後，若偏離 EMA20 過遠，避免追價
+    MAX_EXTENSION_ATR = {
+        "LONG": 2.5,
+        "SHORT": 2.5,
+    }
 
     def __init__(self, min_score=None, breakout_lookback=20):
         self.min_score = (
@@ -279,7 +293,6 @@ class StrategyEngine:
         if pd.isna(prior_high):
             return False
 
-        # 突破策略必須有成交量確認，不因 K 線數量不足而豁免。
         volume_confirmed = (
             f["volume_ma"] is not None
             and f["volume_ma"] > 0
@@ -289,9 +302,20 @@ class StrategyEngine:
         if not volume_confirmed:
             return False
 
+        if f["close"] <= float(prior_high):
+            return False
+
+        # 避免突破後價格已遠離 EMA20，仍然追價。
+        atr = f.get("atr")
+
+        if atr is not None and atr > 0:
+            extension = (f["close"] - f["ema20"]) / atr
+
+            if extension > self.MAX_EXTENSION_ATR["LONG"]:
+                return False
+
         return (
-            f["close"] > float(prior_high)
-            and f["close"] > f["ema20"]
+            f["close"] > f["ema20"]
             and f["ema7"] > f["ema20"]
             and f["macd_hist"] > 0
             and f["macd_hist"] > f["previous_hist"]
@@ -323,7 +347,6 @@ class StrategyEngine:
         if pd.isna(prior_low):
             return False
 
-        # 跌破策略必須有成交量確認，不因 K 線數量不足而豁免。
         volume_confirmed = (
             f["volume_ma"] is not None
             and f["volume_ma"] > 0
@@ -333,9 +356,20 @@ class StrategyEngine:
         if not volume_confirmed:
             return False
 
+        if f["close"] >= float(prior_low):
+            return False
+
+        # 避免跌破後已遠離 EMA20，仍然追空。
+        atr = f.get("atr")
+
+        if atr is not None and atr > 0:
+            extension = (f["ema20"] - f["close"]) / atr
+
+            if extension > self.MAX_EXTENSION_ATR["SHORT"]:
+                return False
+
         return (
-            f["close"] < float(prior_low)
-            and f["close"] < f["ema20"]
+            f["close"] < f["ema20"]
             and f["ema7"] < f["ema20"]
             and f["macd_hist"] < 0
             and f["macd_hist"] < f["previous_hist"]
@@ -397,6 +431,48 @@ class StrategyEngine:
 
         return points, reasons
 
+    @staticmethod
+    def _timeframe_state(f):
+        """使用 EMA 與 DMI 判斷單一週期方向。"""
+        bullish = (
+            f["ema7"] > f["ema20"]
+            and f["plus_di"] > f["minus_di"]
+        )
+
+        bearish = (
+            f["ema7"] < f["ema20"]
+            and f["minus_di"] > f["plus_di"]
+        )
+
+        if bullish:
+            return "LONG"
+
+        if bearish:
+            return "SHORT"
+
+        return "NEUTRAL"
+
+    def _timeframe_conflict(self, f1, f4, direction, strategy):
+        state_1h = self._timeframe_state(f1)
+        state_4h = self._timeframe_state(f4)
+
+        if state_1h == "NEUTRAL" or state_4h == "NEUTRAL":
+            return 0, []
+
+        if state_1h == state_4h:
+            if state_1h == direction:
+                return 0, ["1H／4H 方向一致"]
+
+            return 0, ["1H／4H 同向，但與策略方向相反"]
+
+        penalty = self.TIMEFRAME_CONFLICT_PENALTY.get(
+            strategy, 5
+        )
+
+        return -penalty, [
+            f"1H／4H 趨勢衝突（1H={state_1h}、4H={state_4h}），扣 {penalty} 分"
+        ]
+
     def _fibonacci_context(self, df, direction):
         if FibonacciEngine is None or len(df) < 10:
             return None
@@ -450,7 +526,9 @@ class StrategyEngine:
         f,
         direction,
         strategy,
-        fib_context
+        fib_context,
+        timeframe_penalty=0,
+        timeframe_reasons=None
     ):
         score = base_score
         reasons = []
@@ -506,6 +584,11 @@ class StrategyEngine:
                 f"接近 Fibonacci {fib_context['level']} "
                 f"（距離 {fib_context['distance_pct']:.2f}%）"
             )
+
+        score += timeframe_penalty
+
+        if timeframe_reasons:
+            reasons.extend(timeframe_reasons)
 
         return max(0, min(100, round(score))), reasons
 
@@ -567,17 +650,42 @@ class StrategyEngine:
         fib_long = self._fibonacci_context(df_4h, "LONG")
         fib_short = self._fibonacci_context(df_4h, "SHORT")
 
+        long_a_penalty, long_a_conflict = (
+            self._timeframe_conflict(
+                f1, f4, "LONG", "LONG-A"
+            )
+        )
+        long_b_penalty, long_b_conflict = (
+            self._timeframe_conflict(
+                f1, f4, "LONG", "LONG-B"
+            )
+        )
+        short_a_penalty, short_a_conflict = (
+            self._timeframe_conflict(
+                f1, f4, "SHORT", "SHORT-A"
+            )
+        )
+        short_b_penalty, short_b_conflict = (
+            self._timeframe_conflict(
+                f1, f4, "SHORT", "SHORT-B"
+            )
+        )
+
         long_a_score, long_a_extra = self._strategy_score(
-            long_score, f1, "LONG", "LONG-A", fib_long
+            long_score, f1, "LONG", "LONG-A", fib_long,
+            long_a_penalty, long_a_conflict
         )
         long_b_score, long_b_extra = self._strategy_score(
-            long_score, f1, "LONG", "LONG-B", fib_long
+            long_score, f1, "LONG", "LONG-B", fib_long,
+            long_b_penalty, long_b_conflict
         )
         short_a_score, short_a_extra = self._strategy_score(
-            short_score, f1, "SHORT", "SHORT-A", fib_short
+            short_score, f1, "SHORT", "SHORT-A", fib_short,
+            short_a_penalty, short_a_conflict
         )
         short_b_score, short_b_extra = self._strategy_score(
-            short_score, f1, "SHORT", "SHORT-B", fib_short
+            short_score, f1, "SHORT", "SHORT-B", fib_short,
+            short_b_penalty, short_b_conflict
         )
 
         candidates = []
