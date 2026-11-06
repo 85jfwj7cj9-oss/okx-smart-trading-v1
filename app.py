@@ -1,5 +1,6 @@
 
 import os
+import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -7,42 +8,18 @@ from flask import Flask, jsonify, request, render_template_string
 
 from config import Config
 from scanner import MarketScanner
+from scheduler import TradingScheduler
+from line_notifier import LineNotifier
+from database import Database
+
 
 app = Flask(__name__)
 
 APP_NAME = "OKX SMART TRADING V1.0"
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei")
 
-STRATEGY_PANELS = [
-    {
-        "key": "long_a_candidates",
-        "title": "🟢 LONG-A 提前埋伏做多",
-        "panel": "longAPanel",
-        "list": "longAList",
-        "direction": "long",
-    },
-    {
-        "key": "long_b_candidates",
-        "title": "🚀 LONG-B 突破確認做多",
-        "panel": "longBPanel",
-        "list": "longBList",
-        "direction": "long",
-    },
-    {
-        "key": "short_a_candidates",
-        "title": "🔴 SHORT-A 提前埋伏做空",
-        "panel": "shortAPanel",
-        "list": "shortAList",
-        "direction": "short",
-    },
-    {
-        "key": "short_b_candidates",
-        "title": "📉 SHORT-B 跌破確認做空",
-        "panel": "shortBPanel",
-        "list": "shortBList",
-        "direction": "short",
-    },
-]
+_scheduler = None
+_scheduler_lock = threading.Lock()
 
 
 def current_time():
@@ -58,8 +35,47 @@ def get_scanner():
 
     return MarketScanner(
         max_symbols=max_symbols,
-        min_relative_strength=min_rs
+        min_relative_strength=min_rs,
     )
+
+
+def get_scheduler():
+    """
+    建立單一排程器實例。
+
+    正式環境明確傳入 Database()，
+    讓掃描、訊號及通知紀錄使用同一個資料庫。
+    """
+    global _scheduler
+
+    if _scheduler is not None:
+        return _scheduler
+
+    with _scheduler_lock:
+        if _scheduler is not None:
+            return _scheduler
+
+        scanner = get_scanner()
+        notifier = LineNotifier()
+        database = Database()
+
+        interval = int(
+            os.getenv("SCAN_INTERVAL_SECONDS", "300")
+        )
+
+        summary_hour = int(
+            os.getenv("SUMMARY_HOUR", "21")
+        )
+
+        _scheduler = TradingScheduler(
+            scanner=scanner,
+            notifier=notifier,
+            database=database,
+            interval_seconds=interval,
+            summary_hour=summary_hour,
+        )
+
+    return _scheduler
 
 
 def verify_scan_key():
@@ -78,6 +94,18 @@ def verify_scan_key():
     return True, None
 
 
+def authorized_response():
+    authorized, error = verify_scan_key()
+
+    if not authorized:
+        return jsonify({
+            "status": "error",
+            "error": error,
+        }), 401
+
+    return None
+
+
 @app.route("/")
 def home():
     return render_template_string("""
@@ -87,7 +115,6 @@ def home():
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ app_name }}</title>
-
 <style>
 * { box-sizing: border-box; }
 
@@ -180,8 +207,6 @@ button:disabled { opacity: .5; }
     margin-top: 5px;
 }
 
-a { color: #60a5fa; }
-
 .summary-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -194,6 +219,8 @@ a { color: #60a5fa; }
     border-radius: 8px;
     font-size: 13px;
 }
+
+a { color: #60a5fa; }
 
 @media (max-width: 420px) {
     body { padding: 9px; }
@@ -208,12 +235,9 @@ a { color: #60a5fa; }
 <div class="panel">
     <h1>{{ app_name }}</h1>
     <p class="status">● 網頁伺服器已啟動</p>
-    <p class="muted">
-        交易模式：模擬觀察，不會自動下單
-    </p>
-    <p id="serverTime" class="muted">
-        讀取系統時間中...
-    </p>
+    <p class="muted">交易模式：模擬觀察，不會自動下單</p>
+    <p id="serverTime" class="muted">讀取系統時間中...</p>
+    <p id="systemStatus" class="muted">讀取系統狀態中...</p>
     <p>
         <a href="/health">健康檢查</a> |
         <a href="/api/status">API 狀態</a>
@@ -225,21 +249,12 @@ a { color: #60a5fa; }
     <p class="muted">
         請輸入部署時設定的 SCAN_API_KEY，才可執行掃描。
     </p>
-
-    <input
-        id="scanKey"
-        type="password"
-        placeholder="輸入掃描授權碼"
-        autocomplete="off"
-    >
-
+    <input id="scanKey" type="password"
+        placeholder="輸入掃描授權碼" autocomplete="off">
     <button id="scanButton" onclick="runScan()">
         開始掃描 OKX 市場
     </button>
-
-    <p id="scanStatus" class="muted">
-        等待掃描指令
-    </p>
+    <p id="scanStatus" class="muted">等待掃描指令</p>
 </div>
 
 <div id="summary" class="panel" hidden>
@@ -294,6 +309,33 @@ const keyInput = document.getElementById("scanKey");
 const scanButton = document.getElementById("scanButton");
 const scanStatus = document.getElementById("scanStatus");
 
+const strategyPanels = [
+    {
+        key: "long_a_candidates",
+        panel: "longAPanel",
+        list: "longAList",
+        direction: "long"
+    },
+    {
+        key: "long_b_candidates",
+        panel: "longBPanel",
+        list: "longBList",
+        direction: "long"
+    },
+    {
+        key: "short_a_candidates",
+        panel: "shortAPanel",
+        list: "shortAList",
+        direction: "short"
+    },
+    {
+        key: "short_b_candidates",
+        panel: "shortBPanel",
+        list: "shortBList",
+        direction: "short"
+    }
+];
+
 function addLine(card, text, className = "detail") {
     const div = document.createElement("div");
     div.className = className;
@@ -317,20 +359,20 @@ function makeCard(item, direction) {
         "策略評分：" + (item.score ?? "無資料") + " 分";
     card.appendChild(score);
 
-    addLine(
-        card,
-        "方向：" + (item.direction || "NEUTRAL")
-    );
+    addLine(card, "方向：" + (item.direction || "NEUTRAL"));
 
-    if (item.strategy) {
-        addLine(
-            card,
-            "策略訊號：" +
-            (item.strategy.signal || item.strategy.name || "無")
-        );
-    } else if (item.strategy_name) {
-        addLine(card, "策略：" + item.strategy_name);
-    }
+    const strategy = item.strategy;
+    const strategyName =
+        typeof strategy === "string"
+            ? strategy
+            : (
+                strategy?.name ||
+                strategy?.strategy ||
+                item.strategy_name ||
+                "無"
+            );
+
+    addLine(card, "策略：" + strategyName);
 
     if (item.price !== undefined && item.price !== null) {
         addLine(card, "最新參考價格：" + item.price);
@@ -351,35 +393,16 @@ function makeCard(item, direction) {
 
     const entry = trade.entry_price ?? item.entry_price;
     const stop = trade.stop_loss ?? item.stop_loss;
-    const tp1 = trade.tp1 ?? item.tp1;
+    const tp1 = trade.tp1 ?? trade.take_profit ?? item.tp1;
     const tp2 = trade.tp2 ?? item.tp2;
     const rr = trade.reward_risk_ratio ??
                item.reward_risk_ratio;
 
-    addLine(
-        card,
-        "進場：" + (entry ?? "尚無交易計畫")
-    );
-
-    addLine(
-        card,
-        "停損：" + (stop ?? "尚無")
-    );
-
-    addLine(
-        card,
-        "TP1：" + (tp1 ?? "尚無")
-    );
-
-    addLine(
-        card,
-        "TP2：" + (tp2 ?? "尚無")
-    );
-
-    addLine(
-        card,
-        "風險報酬比：" + (rr ?? "尚無")
-    );
+    addLine(card, "進場：" + (entry ?? "尚無交易計畫"));
+    addLine(card, "停損：" + (stop ?? "尚無"));
+    addLine(card, "TP1：" + (tp1 ?? "尚無"));
+    addLine(card, "TP2：" + (tp2 ?? "尚無"));
+    addLine(card, "風險報酬比：" + (rr ?? "尚無"));
 
     if (trade.status) {
         addLine(card, "交易計畫狀態：" + trade.status);
@@ -393,18 +416,13 @@ function makeCard(item, direction) {
         );
     }
 
-    if (Array.isArray(item.reasons) && item.reasons.length > 0) {
-        addLine(
-            card,
-            "判斷理由：" + item.reasons.join("；")
-        );
+    if (Array.isArray(item.reasons) && item.reasons.length) {
+        addLine(card, "判斷理由：" + item.reasons.join("；"));
     }
 
     addLine(
         card,
-        item.simulation_only === false
-            ? "注意：非模擬訊號"
-            : "模式：模擬觀察，不會自動下單"
+        "模式：模擬觀察，不會自動下單"
     );
 
     return card;
@@ -431,7 +449,7 @@ function renderList(elementId, panelId, items, direction) {
 }
 
 function hideAllResultPanels() {
-    const ids = [
+    [
         "summary",
         "longAPanel",
         "longBPanel",
@@ -441,9 +459,7 @@ function hideAllResultPanels() {
         "shortPanel",
         "strongPanel",
         "errorPanel"
-    ];
-
-    ids.forEach(id => {
+    ].forEach(id => {
         document.getElementById(id).hidden = true;
     });
 }
@@ -510,7 +526,7 @@ async function runScan() {
 
     scanButton.disabled = true;
     scanStatus.textContent =
-        "正在取得 OKX 行情並分析，請稍候...";
+        "正在掃描 OKX 行情、保存資料及處理通知，請稍候...";
     scanStatus.className = "muted";
 
     hideAllResultPanels();
@@ -535,7 +551,7 @@ async function runScan() {
 
         renderSummary(data);
 
-        STRATEGY_PANELS.forEach(config => {
+        strategyPanels.forEach(config => {
             renderList(
                 config.list,
                 config.panel,
@@ -544,7 +560,6 @@ async function runScan() {
             );
         });
 
-        // 保留舊版候選清單
         renderList(
             "longList",
             "longPanel",
@@ -568,7 +583,8 @@ async function runScan() {
 
         renderErrors(data.results);
 
-        scanStatus.textContent = "掃描完成";
+        scanStatus.textContent =
+            "掃描完成；掃描紀錄及模擬訊號已交由排程器處理";
         scanStatus.className = "status";
 
     } catch (error) {
@@ -587,6 +603,11 @@ async function loadStatus() {
         document.getElementById("serverTime").textContent =
             "伺服器時間：" + data.time;
 
+        document.getElementById("systemStatus").textContent =
+            "資料庫：" +
+            (data.database?.status || "未檢查") +
+            "；交易模式：模擬觀察";
+
     } catch (error) {
         document.getElementById("serverTime").textContent =
             "無法讀取伺服器狀態";
@@ -602,15 +623,44 @@ loadStatus();
 
 @app.route("/health")
 def health():
+    database_status = {
+        "status": "not_checked"
+    }
+
+    try:
+        database = Database()
+        database_status = database.health_check()
+    except Exception as exc:
+        app.logger.exception("Database health check failed")
+        database_status = {
+            "status": "error",
+            "error": str(exc),
+        }
+
     return jsonify({
-        "status": "ok",
+        "status": (
+            "ok"
+            if database_status.get("status") in ("ok", "healthy")
+            else "degraded"
+        ),
         "application": APP_NAME,
-        "time": current_time()
+        "time": current_time(),
+        "database": database_status,
+        "trading_mode": "simulation_only",
+        "auto_trading": False,
     })
 
 
 @app.route("/api/status")
 def api_status():
+    scheduler_status = {}
+
+    try:
+        if _scheduler is not None:
+            scheduler_status = _scheduler.get_status()
+    except Exception:
+        app.logger.exception("讀取排程狀態失敗")
+
     return jsonify({
         "application": APP_NAME,
         "version": "1.0.0",
@@ -620,36 +670,73 @@ def api_status():
         "okx_market_data": "available_on_scan",
         "line_notification": (
             "configured"
-            if os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+            if LineNotifier().is_configured()
             else "not_configured"
         ),
         "scan_api_key_configured": bool(
             os.getenv("SCAN_API_KEY", "").strip()
+        ),
+        "database_backend": getattr(
+            Config,
+            "DATABASE_BACKEND",
+            "unknown",
         ),
         "timeframes": ["1H", "4H"],
         "strategies": [
             "LONG-A",
             "LONG-B",
             "SHORT-A",
-            "SHORT-B"
+            "SHORT-B",
         ],
-        "time": current_time()
+        "scheduler": scheduler_status,
+        "time": current_time(),
     })
+
+
+@app.route("/api/scheduler/status")
+def api_scheduler_status():
+    auth_response = authorized_response()
+
+    if auth_response:
+        return auth_response
+
+    try:
+        scheduler = get_scheduler()
+
+        return jsonify({
+            "status": "ok",
+            "scheduler": scheduler.get_status(),
+            "trading_mode": "simulation_only",
+            "auto_trading": False,
+        })
+
+    except Exception as exc:
+        app.logger.exception("讀取排程器狀態失敗")
+
+        return jsonify({
+            "status": "error",
+            "error": str(exc),
+        }), 500
 
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    authorized, error = verify_scan_key()
+    auth_response = authorized_response()
 
-    if not authorized:
-        return jsonify({
-            "status": "error",
-            "error": error
-        }), 401
+    if auth_response:
+        return auth_response
 
     try:
-        scanner = get_scanner()
-        result = scanner.scan()
+        scheduler = get_scheduler()
+
+        # 統一由排程器執行掃描、保存紀錄及處理通知。
+        result = scheduler.run_once()
+
+        if not isinstance(result, dict):
+            raise ValueError("排程器回傳格式錯誤")
+
+        if result.get("status") == "error":
+            return jsonify(result), 500
 
         return jsonify(result)
 
@@ -661,7 +748,7 @@ def api_scan():
             "error": str(exc),
             "time": current_time(),
             "trading_mode": "simulation_only",
-            "auto_trading": False
+            "auto_trading": False,
         }), 500
 
 
@@ -671,5 +758,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port,
-        debug=False
+        debug=False,
     )
