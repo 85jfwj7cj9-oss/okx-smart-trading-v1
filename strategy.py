@@ -1,3 +1,4 @@
+
 import math
 import pandas as pd
 
@@ -155,7 +156,6 @@ class StrategyEngine:
                 return 10, "相對 BTC 強勢"
             if rs < -2:
                 return -5, "相對 BTC 弱勢，扣分"
-
         else:
             if rs < 0:
                 return 10, "相對 BTC 弱勢"
@@ -197,7 +197,6 @@ class StrategyEngine:
         adjustment, rs_reason = self._relative_strength_adjustment(
             relative_strength, "LONG"
         )
-
         score += adjustment
 
         if relative_strength is not None:
@@ -238,7 +237,6 @@ class StrategyEngine:
         adjustment, rs_reason = self._relative_strength_adjustment(
             relative_strength, "SHORT"
         )
-
         score += adjustment
 
         if relative_strength is not None:
@@ -281,10 +279,15 @@ class StrategyEngine:
         if pd.isna(prior_high):
             return False
 
+        # 突破策略必須有成交量確認，不因 K 線數量不足而豁免。
         volume_confirmed = (
-            f["volume_ma"] > 0
+            f["volume_ma"] is not None
+            and f["volume_ma"] > 0
             and f["volume"] > f["volume_ma"]
         )
+
+        if not volume_confirmed:
+            return False
 
         return (
             f["close"] > float(prior_high)
@@ -292,7 +295,6 @@ class StrategyEngine:
             and f["ema7"] > f["ema20"]
             and f["macd_hist"] > 0
             and f["macd_hist"] > f["previous_hist"]
-            and (volume_confirmed or len(df) < 20)
         )
 
     def _early_short(self, f):
@@ -321,10 +323,15 @@ class StrategyEngine:
         if pd.isna(prior_low):
             return False
 
+        # 跌破策略必須有成交量確認，不因 K 線數量不足而豁免。
         volume_confirmed = (
-            f["volume_ma"] > 0
+            f["volume_ma"] is not None
+            and f["volume_ma"] > 0
             and f["volume"] > f["volume_ma"]
         )
+
+        if not volume_confirmed:
+            return False
 
         return (
             f["close"] < float(prior_low)
@@ -332,7 +339,6 @@ class StrategyEngine:
             and f["ema7"] < f["ema20"]
             and f["macd_hist"] < 0
             and f["macd_hist"] < f["previous_hist"]
-            and (volume_confirmed or len(df) < 20)
         )
 
     @staticmethod
@@ -452,7 +458,6 @@ class StrategyEngine:
         optional_points, optional_reasons = (
             self._optional_confirmation(f, direction)
         )
-
         score += optional_points
         reasons.extend(optional_reasons)
 
@@ -483,7 +488,8 @@ class StrategyEngine:
 
         else:
             volume_ok = (
-                f["volume_ma"] > 0
+                f["volume_ma"] is not None
+                and f["volume_ma"] > 0
                 and f["volume"] > f["volume_ma"]
             )
 
@@ -543,112 +549,63 @@ class StrategyEngine:
             )
 
         long_1h, long_reasons = self._score_long(
-            f1,
-            relative_strength_1h
+            f1, relative_strength_1h
         )
-
         short_1h, short_reasons = self._score_short(
-            f1,
-            relative_strength_1h
+            f1, relative_strength_1h
         )
-
         long_4h, long_4h_reasons = self._score_long(
-            f4,
-            relative_strength_4h
+            f4, relative_strength_4h
         )
-
         short_4h, short_4h_reasons = self._score_short(
-            f4,
-            relative_strength_4h
+            f4, relative_strength_4h
         )
 
-        # 保留舊版總分欄位與 65/35 權重。
-        long_score = self._weighted_score(
-            long_1h,
-            long_4h
-        )
+        long_score = self._weighted_score(long_1h, long_4h)
+        short_score = self._weighted_score(short_1h, short_4h)
 
-        short_score = self._weighted_score(
-            short_1h,
-            short_4h
-        )
-
-        fib_long = self._fibonacci_context(
-            df_4h,
-            "LONG"
-        )
-
-        fib_short = self._fibonacci_context(
-            df_4h,
-            "SHORT"
-        )
+        fib_long = self._fibonacci_context(df_4h, "LONG")
+        fib_short = self._fibonacci_context(df_4h, "SHORT")
 
         long_a_score, long_a_extra = self._strategy_score(
-            long_score,
-            f1,
-            "LONG",
-            "LONG-A",
-            fib_long
+            long_score, f1, "LONG", "LONG-A", fib_long
         )
-
         long_b_score, long_b_extra = self._strategy_score(
-            long_score,
-            f1,
-            "LONG",
-            "LONG-B",
-            fib_long
+            long_score, f1, "LONG", "LONG-B", fib_long
         )
-
         short_a_score, short_a_extra = self._strategy_score(
-            short_score,
-            f1,
-            "SHORT",
-            "SHORT-A",
-            fib_short
+            short_score, f1, "SHORT", "SHORT-A", fib_short
         )
-
         short_b_score, short_b_extra = self._strategy_score(
-            short_score,
-            f1,
-            "SHORT",
-            "SHORT-B",
-            fib_short
+            short_score, f1, "SHORT", "SHORT-B", fib_short
         )
 
         candidates = []
 
         if self._early_long(f1):
             candidates.append((
-                "LONG-A",
-                "LONG",
-                long_a_score,
+                "LONG-A", "LONG", long_a_score,
                 long_reasons + long_4h_reasons + long_a_extra,
                 fib_long
             ))
 
         if self._breakout_long(f1, df_1h):
             candidates.append((
-                "LONG-B",
-                "LONG",
-                long_b_score,
+                "LONG-B", "LONG", long_b_score,
                 long_reasons + long_4h_reasons + long_b_extra,
                 fib_long
             ))
 
         if self._early_short(f1):
             candidates.append((
-                "SHORT-A",
-                "SHORT",
-                short_a_score,
+                "SHORT-A", "SHORT", short_a_score,
                 short_reasons + short_4h_reasons + short_a_extra,
                 fib_short
             ))
 
         if self._breakdown_short(f1, df_1h):
             candidates.append((
-                "SHORT-B",
-                "SHORT",
-                short_b_score,
+                "SHORT-B", "SHORT", short_b_score,
                 short_reasons + short_4h_reasons + short_b_extra,
                 fib_short
             ))
@@ -666,9 +623,7 @@ class StrategyEngine:
                 continue
 
             invalidation = (
-                f1["low"]
-                if direction == "LONG"
-                else f1["high"]
+                f1["low"] if direction == "LONG" else f1["high"]
             )
 
             signals.append({
