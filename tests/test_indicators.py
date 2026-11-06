@@ -176,3 +176,68 @@ def test_calculate_all():
         assert column in result.columns
 
     assert len(result) == len(df)
+    def test_supertrend_atr_warmup():
+    """ATR 尚未形成前，不應產生有效 Supertrend。"""
+    df = make_data(rows=50)
+
+    result = IndicatorEngine.supertrend(
+        df,
+        period=10,
+        multiplier=3.0
+    )
+
+    # Wilder ATR 的第一個有效值應在第 10 個索引位置。
+    assert result["supertrend"].iloc[:10].isna().all()
+    assert result["supertrend"].iloc[10:].notna().any()
+
+
+def test_supertrend_no_future_data_leakage():
+    """加入未來 K 線，不應改變過去已計算的結果。"""
+    df = make_data(rows=100)
+
+    original = IndicatorEngine.supertrend(
+        df,
+        period=10,
+        multiplier=3.0
+    )
+
+    extended_df = pd.concat([
+        df,
+        make_data(rows=30).assign(
+            open=lambda x: x["open"] + 100,
+            high=lambda x: x["high"] + 100,
+            low=lambda x: x["low"] + 100,
+            close=lambda x: x["close"] + 100
+        )
+    ], ignore_index=True)
+
+    extended = IndicatorEngine.supertrend(
+        extended_df,
+        period=10,
+        multiplier=3.0
+    )
+
+    pd.testing.assert_series_equal(
+        original["supertrend"],
+        extended["supertrend"].iloc[:len(df)].reset_index(drop=True),
+        check_names=False
+    )
+
+    pd.testing.assert_series_equal(
+        original["supertrend_direction"],
+        extended["supertrend_direction"].iloc[:len(df)].reset_index(drop=True),
+        check_names=False
+    )
+
+
+def test_supertrend_direction_values():
+    """趨勢方向只能是多方、空方或初始化狀態。"""
+    df = make_data(rows=250)
+
+    result = IndicatorEngine.supertrend(df)
+
+    assert result["supertrend_direction"].isin(
+        [-1, 0, 1]
+    ).all()
+
+    assert result["supertrend"].dropna().notna().all()
