@@ -1,19 +1,10 @@
 
 import logging
 import threading
-import time
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
 
-from config import Config
 from scanner import MarketScanner
 from line_notifier import LineNotifier
-
-try:
-    from database import Database
-except ImportError:
-    Database = None
-
 
 logger = logging.getLogger(__name__)
 
@@ -22,13 +13,8 @@ class TradingScheduler:
     """
     OKX SMART TRADING 排程器。
 
-    - 定時執行市場掃描
-    - 支援 LONG-A、LONG-B、SHORT-A、SHORT-B
-    - 相容舊版 long_candidates / short_candidates
-    - 只通知 simulation_only 訊號
-    - 支援資料庫掃描、訊號及通知紀錄
-    - 防止重複掃描及重複通知
-    - 不執行真實下單
+    支援四種獨立策略及舊版 LONG / SHORT 候選清單。
+    只發送 simulation_only 訊號，不執行真實下單。
     """
 
     STRATEGY_LIST_KEYS = (
@@ -56,13 +42,9 @@ class TradingScheduler:
 
         self.summary_hour = summary_hour
 
+        # 重要：不自動建立資料庫。
+        # 測試環境預設不使用資料庫；正式環境應明確傳入 Database()。
         self.database = database
-        if self.database is None and Database is not None:
-            try:
-                self.database = Database()
-            except Exception:
-                logger.exception("資料庫初始化失敗，排程器將以無資料庫模式運作")
-                self.database = None
 
         self._thread = None
         self._stop_event = threading.Event()
@@ -105,10 +87,11 @@ class TradingScheduler:
             return False
 
         plan = candidate.get("trade_plan")
-        if not isinstance(plan, dict):
-            return False
 
-        return plan.get("status") == "simulation_only"
+        return (
+            isinstance(plan, dict)
+            and plan.get("status") == "simulation_only"
+        )
 
     @staticmethod
     def _get_strategy_name(candidate, fallback=""):
@@ -128,17 +111,11 @@ class TradingScheduler:
             or fallback
         )
 
-    @staticmethod
-    def _get_candidate_key(candidate):
+    @classmethod
+    def _get_candidate_key(cls, candidate):
         plan = candidate.get("trade_plan") or {}
 
-        symbol = str(candidate.get("symbol", "")).upper()
-        direction = str(candidate.get("direction", "")).upper()
-        strategy = (
-            candidate.get("strategy")
-            if isinstance(candidate.get("strategy"), str)
-            else candidate.get("strategy_name", "")
-        )
+        strategy = cls._get_strategy_name(candidate)
 
         entry = (
             plan.get("entry_price")
@@ -158,8 +135,12 @@ class TradingScheduler:
             plan.get("take_profit")
             or plan.get("tp1")
             or candidate.get("take_profit")
+            or candidate.get("tp1")
             or ""
         )
+
+        symbol = str(candidate.get("symbol", "")).upper()
+        direction = str(candidate.get("direction", "")).upper()
 
         return (
             f"{symbol}:{direction}:{strategy}:"
@@ -167,9 +148,7 @@ class TradingScheduler:
         )
 
     def _collect_candidates(self, scan_result):
-        """
-        同時支援新版四策略清單及舊版 LONG / SHORT 清單。
-        """
+        """收集新版四策略及舊版 LONG / SHORT 候選清單。"""
         if isinstance(scan_result, list):
             return scan_result
 
@@ -198,10 +177,14 @@ class TradingScheduler:
                 candidate_copy = dict(candidate)
 
                 if not candidate_copy.get("strategy"):
-                    fallback = key.replace("_candidates", "").upper()
+                    fallback = key.replace(
+                        "_candidates", ""
+                    ).upper()
                     candidate_copy["strategy"] = fallback
 
-                candidate_key = self._get_candidate_key(candidate_copy)
+                candidate_key = self._get_candidate_key(
+                    candidate_copy
+                )
 
                 if candidate_key in seen:
                     continue
@@ -218,7 +201,12 @@ class TradingScheduler:
         if self.database is None:
             return False
 
-        method = getattr(self.database, "notification_exists", None)
+        method = getattr(
+            self.database,
+            "notification_exists",
+            None,
+        )
+
         if not callable(method):
             return False
 
@@ -237,7 +225,12 @@ class TradingScheduler:
         if self.database is None:
             return
 
-        method = getattr(self.database, "save_notification", None)
+        method = getattr(
+            self.database,
+            "save_notification",
+            None,
+        )
+
         if not callable(method):
             return
 
@@ -245,8 +238,6 @@ class TradingScheduler:
             isinstance(result, dict)
             and result.get("success") is True
         )
-
-        status = "sent" if success else "failed"
 
         try:
             method(
@@ -258,7 +249,7 @@ class TradingScheduler:
                     if isinstance(result, dict)
                     else result
                 ),
-                status=status,
+                status="sent" if success else "failed",
                 error_message=(
                     None
                     if success
@@ -277,6 +268,7 @@ class TradingScheduler:
             return
 
         method = getattr(self.database, "save_scan", None)
+
         if not callable(method):
             return
 
@@ -290,6 +282,7 @@ class TradingScheduler:
             return
 
         method = getattr(self.database, "save_signal", None)
+
         if not callable(method):
             return
 
@@ -335,10 +328,6 @@ class TradingScheduler:
                 )
 
     def _send_candidate_notifications(self, scan_result):
-        """
-        接受完整掃描結果 dict 或候選清單 list。
-        只發送有效的模擬訊號。
-        """
         candidates = self._collect_candidates(scan_result)
         notified = 0
 
@@ -418,7 +407,9 @@ class TradingScheduler:
                                 status="sent",
                             )
                         except Exception:
-                            logger.exception("保存每日摘要紀錄失敗")
+                            logger.exception(
+                                "保存每日摘要紀錄失敗"
+                            )
 
         except Exception:
             logger.exception("發送每日掃描摘要失敗")
