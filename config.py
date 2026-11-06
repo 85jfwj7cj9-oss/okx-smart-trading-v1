@@ -43,9 +43,22 @@ def get_float(name, default, minimum=None, maximum=None):
     return value
 
 
+def normalize_database_url(url):
+    """正規化 Render PostgreSQL 連線網址。"""
+
+    if not url:
+        return ""
+
+    url = url.strip()
+
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+
+    return url
+
+
 class Config:
 
-    # Application
     APP_NAME = "OKX SMART TRADING V1.0"
     APP_ENV = os.getenv("APP_ENV", "development")
     TIMEZONE = os.getenv("TIMEZONE", "Asia/Taipei")
@@ -57,16 +70,13 @@ class Config:
 
     ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 
-    # OKX public market data
     OKX_BASE_URL = os.getenv(
         "OKX_BASE_URL",
         "https://www.okx.com"
     ).rstrip("/")
 
-    # Current version uses public market data only.
     OKX_DEMO_MODE = True
 
-    # Scanner
     SCAN_INTERVAL_SECONDS = get_int(
         "SCAN_INTERVAL_SECONDS", 60, 15, 3600
     )
@@ -86,7 +96,6 @@ class Config:
         "BTC-USDT-SWAP"
     )
 
-    # Strategy
     MIN_SIGNAL_SCORE = get_int(
         "MIN_SIGNAL_SCORE", 60, 0, 100
     )
@@ -94,7 +103,6 @@ class Config:
     ENABLE_LONG = get_bool("ENABLE_LONG", True)
     ENABLE_SHORT = get_bool("ENABLE_SHORT", True)
 
-    # Risk management - simulation only
     INITIAL_EQUITY_USDT = get_float(
         "INITIAL_EQUITY_USDT", 1000, 0.01
     )
@@ -115,7 +123,6 @@ class Config:
         "SLIPPAGE_RATE", 0.0005, 0, 0.1
     )
 
-    # LINE
     LINE_CHANNEL_ACCESS_TOKEN = os.getenv(
         "LINE_CHANNEL_ACCESS_TOKEN", ""
     )
@@ -133,11 +140,23 @@ class Config:
     )
 
     # Database
-    DATABASE_URL = os.getenv(
-        "DATABASE_URL", ""
+    DATABASE_URL = normalize_database_url(
+        os.getenv("DATABASE_URL", "")
     )
 
-    # Trading safety
+    DATABASE_PATH = os.getenv(
+        "DATABASE_PATH",
+        "data/okx_trading.db"
+    )
+
+    DATABASE_CONNECT_TIMEOUT = get_int(
+        "DATABASE_CONNECT_TIMEOUT", 15, 1, 120
+    )
+
+    DATABASE_BACKEND = (
+        "postgresql" if DATABASE_URL else "sqlite"
+    )
+
     AUTO_TRADING_ENABLED = False
     LIVE_ORDER_ENABLED = False
 
@@ -169,6 +188,17 @@ class Config:
 
         if not 0 <= cls.MIN_SIGNAL_SCORE <= 100:
             errors.append("Invalid minimum signal score")
+
+        if cls.DATABASE_URL and not cls.DATABASE_URL.startswith(
+            "postgresql://"
+        ):
+            errors.append("Invalid PostgreSQL DATABASE_URL")
+
+        if cls.APP_ENV == "production":
+            if cls.SECRET_KEY == (
+                "development-only-change-before-deployment"
+            ):
+                errors.append("APP_SECRET_KEY must be configured")
 
         return errors
 
