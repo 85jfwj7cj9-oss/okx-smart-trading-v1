@@ -14,7 +14,7 @@ class TradingScheduler:
     OKX SMART TRADING 排程器。
 
     支援四種獨立策略及舊版 LONG / SHORT 候選清單。
-    只發送 simulation_only 訊號，不執行真實下單。
+    只處理 simulation_only 訊號，不執行真實下單。
     """
 
     STRATEGY_LIST_KEYS = (
@@ -34,16 +34,18 @@ class TradingScheduler:
     ):
         self.scanner = scanner or MarketScanner()
         self.notifier = notifier or LineNotifier()
-
         self.interval_seconds = max(15, int(interval_seconds))
 
-        if not isinstance(summary_hour, int) or not 0 <= summary_hour <= 23:
+        if (
+            not isinstance(summary_hour, int)
+            or not 0 <= summary_hour <= 23
+        ):
             raise ValueError("summary_hour 必須介於 0 至 23")
 
         self.summary_hour = summary_hour
 
-        # 重要：不自動建立資料庫。
-        # 測試環境預設不使用資料庫；正式環境應明確傳入 Database()。
+        # 不自動建立資料庫，避免測試環境共用資料。
+        # 正式環境由 app.py 明確傳入 Database()。
         self.database = database
 
         self._thread = None
@@ -101,11 +103,14 @@ class TradingScheduler:
             return strategy
 
         if isinstance(strategy, dict):
-            name = strategy.get("name") or strategy.get("strategy")
+            name = (
+                strategy.get("name")
+                or strategy.get("strategy")
+            )
             if name:
                 return str(name)
 
-        return (
+        return str(
             candidate.get("strategy_name")
             or candidate.get("strategy_type")
             or fallback
@@ -114,7 +119,6 @@ class TradingScheduler:
     @classmethod
     def _get_candidate_key(cls, candidate):
         plan = candidate.get("trade_plan") or {}
-
         strategy = cls._get_strategy_name(candidate)
 
         entry = (
@@ -139,8 +143,13 @@ class TradingScheduler:
             or ""
         )
 
-        symbol = str(candidate.get("symbol", "")).upper()
-        direction = str(candidate.get("direction", "")).upper()
+        symbol = str(
+            candidate.get("symbol", "")
+        ).upper()
+
+        direction = str(
+            candidate.get("direction", "")
+        ).upper()
 
         return (
             f"{symbol}:{direction}:{strategy}:"
@@ -149,8 +158,13 @@ class TradingScheduler:
 
     def _collect_candidates(self, scan_result):
         """收集新版四策略及舊版 LONG / SHORT 候選清單。"""
+
         if isinstance(scan_result, list):
-            return scan_result
+            return [
+                dict(item)
+                for item in scan_result
+                if isinstance(item, dict)
+            ]
 
         if not isinstance(scan_result, dict):
             return []
@@ -180,6 +194,7 @@ class TradingScheduler:
                     fallback = key.replace(
                         "_candidates", ""
                     ).upper()
+
                     candidate_copy["strategy"] = fallback
 
                 candidate_key = self._get_candidate_key(
@@ -193,6 +208,104 @@ class TradingScheduler:
                 candidates.append(candidate_copy)
 
         return candidates
+
+    @classmethod
+    def _normalize_candidate_for_notifier(cls, candidate):
+        """
+        將 scanner 候選資料轉成 LineNotifier 可讀取的格式。
+
+        scanner 的 strategy 可能是 LONG-A 文字，
+        LineNotifier 則需要 strategy 字典。
+        """
+
+        if not isinstance(candidate, dict):
+            return None
+
+        normalized = dict(candidate)
+
+        strategy_name = cls._get_strategy_name(candidate)
+
+        strategy_data = candidate.get("strategy")
+
+        if isinstance(strategy_data, dict):
+            strategy_info = dict(strategy_data)
+        else:
+            strategy_info = {}
+
+        score = candidate.get(
+            "score",
+            candidate.get(
+                "strategy_score",
+                strategy_info.get(
+                    "score",
+                    strategy_info.get("signal_score", 0),
+                ),
+            ),
+        )
+
+        strategy_info.update({
+            "name": strategy_name,
+            "strategy": strategy_name,
+            "score": score,
+        })
+
+        normalized["strategy"] = strategy_info
+        normalized["strategy_name"] = strategy_name
+        normalized["score"] = score
+
+        plan = candidate.get("trade_plan")
+
+        if not isinstance(plan, dict):
+            return None
+
+        normalized_plan = dict(plan)
+
+        # LineNotifier 使用 take_profit。
+        # 新版風控也可能使用 tp1。
+        if normalized_plan.get("take_profit") is None:
+            normalized_plan["take_profit"] = (
+                normalized_plan.get("tp1")
+                or candidate.get("take_profit")
+                or candidate.get("tp1")
+            )
+
+        if normalized_plan.get("tp1") is None:
+            normalized_plan["tp1"] = (
+                normalized_plan.get("take_profit")
+            )
+
+        if normalized_plan.get("entry_price") is None:
+            normalized_plan["entry_price"] = (
+                candidate.get("entry_price")
+            )
+
+        if normalized_plan.get("stop_loss") is None:
+            normalized_plan["stop_loss"] = (
+                candidate.get("stop_loss")
+            )
+
+        normalized["trade_plan"] = normalized_plan
+
+        if not isinstance(
+            normalized.get("relative_strength"),
+            dict,
+        ):
+            normalized["relative_strength"] = {}
+
+        # 舊版掃描資料可能只有平均相對強度。
+        relative = dict(normalized["relative_strength"])
+
+        if (
+            "average_relative_strength_pct" in normalized
+            and "average" not in relative
+        ):
+            relative["average"] = (
+                normalized["average_relative_strength_pct"]
+            )
+
+        normalized["relative_strength"] = relative
+
+        return normalized
 
     def _notification_key(self, candidate):
         return self._get_candidate_key(candidate)
@@ -254,7 +367,13 @@ class TradingScheduler:
                     None
                     if success
                     else str(
-                        result.get("error", "通知發送失敗")
+                        result.get(
+                            "error",
+                            result.get(
+                                "message",
+                                "通知發送失敗",
+                            ),
+                        )
                         if isinstance(result, dict)
                         else "通知發送失敗"
                     )
@@ -267,7 +386,11 @@ class TradingScheduler:
         if self.database is None:
             return
 
-        method = getattr(self.database, "save_scan", None)
+        method = getattr(
+            self.database,
+            "save_scan",
+            None,
+        )
 
         if not callable(method):
             return
@@ -281,42 +404,40 @@ class TradingScheduler:
         if self.database is None:
             return
 
-        method = getattr(self.database, "save_signal", None)
+        method = getattr(
+            self.database,
+            "save_signal",
+            None,
+        )
 
         if not callable(method):
             return
 
         for candidate in candidates:
+            if not self._is_simulation_candidate(candidate):
+                continue
+
             try:
-                plan = candidate.get("trade_plan") or {}
-                strategy_name = self._get_strategy_name(candidate)
+                normalized = self._normalize_candidate_for_notifier(
+                    candidate
+                )
 
-                direction = str(
-                    candidate.get("direction", "")
-                ).upper()
+                if normalized is None:
+                    continue
 
-                strategy_data = candidate.get("strategy")
-
-                if isinstance(strategy_data, dict):
-                    strategy_info = dict(strategy_data)
-                else:
-                    strategy_info = {
-                        "name": strategy_name,
-                        "direction": direction,
-                        "score": candidate.get(
-                            "score",
-                            candidate.get("strategy_score", 0),
-                        ),
-                    }
+                plan = normalized["trade_plan"]
+                strategy_info = normalized["strategy"]
 
                 record = {
-                    "symbol": candidate.get("symbol"),
+                    "symbol": normalized.get("symbol"),
                     "strategy": strategy_info,
                     "trade_plan": plan,
                     "relative_strength": (
-                        candidate.get("relative_strength") or {}
+                        normalized.get("relative_strength") or {}
                     ),
-                    "direction": direction,
+                    "direction": str(
+                        normalized.get("direction", "")
+                    ).upper(),
                 }
 
                 method(record)
@@ -340,8 +461,15 @@ class TradingScheduler:
             if self._notification_exists(notification_key):
                 continue
 
+            normalized = self._normalize_candidate_for_notifier(
+                candidate
+            )
+
+            if normalized is None:
+                continue
+
             try:
-                result = self.notifier.send_signal(candidate)
+                result = self.notifier.send_signal(normalized)
 
                 self._record_notification(
                     notification_key,
@@ -375,14 +503,18 @@ class TradingScheduler:
         if datetime.now().hour < self.summary_hour:
             return
 
-        notification_key = f"DAILY_SUMMARY:{today.isoformat()}"
+        notification_key = (
+            f"DAILY_SUMMARY:{today.isoformat()}"
+        )
 
         if self._notification_exists(notification_key):
             self._last_summary_date = today
             return
 
         try:
-            result = self.notifier.send_daily_summary(scan_result)
+            result = self.notifier.send_daily_summary(
+                scan_result
+            )
 
             if (
                 isinstance(result, dict)
@@ -426,7 +558,9 @@ class TradingScheduler:
             scan_result = self.scanner.scan()
 
             if not isinstance(scan_result, dict):
-                raise ValueError("scanner.scan() 必須回傳 dict")
+                raise ValueError(
+                    "scanner.scan() 必須回傳 dict"
+                )
 
             self._last_scan_time = datetime.now(
                 timezone.utc
@@ -438,7 +572,9 @@ class TradingScheduler:
             self._save_scan_history(scan_result)
 
             if scan_result.get("status") == "completed":
-                candidates = self._collect_candidates(scan_result)
+                candidates = self._collect_candidates(
+                    scan_result
+                )
 
                 self._save_signal_history(candidates)
                 self._send_candidate_notifications(scan_result)
@@ -467,7 +603,9 @@ class TradingScheduler:
             except Exception:
                 logger.exception("排程主迴圈發生錯誤")
 
-            self._stop_event.wait(self.interval_seconds)
+            self._stop_event.wait(
+                self.interval_seconds
+            )
 
         with self._status_lock:
             self._running = False
