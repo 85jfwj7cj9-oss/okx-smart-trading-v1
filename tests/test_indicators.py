@@ -26,7 +26,6 @@ def make_data(rows=250):
 
 def test_validate_data():
     df = make_data()
-
     result = IndicatorEngine.validate_data(df)
 
     assert len(result) == 250
@@ -50,7 +49,6 @@ def test_validate_invalid_price():
 
 def test_ema():
     df = make_data()
-
     result = IndicatorEngine.ema(df["close"], 20)
 
     assert len(result) == len(df)
@@ -59,7 +57,6 @@ def test_ema():
 
 def test_rsi():
     df = make_data()
-
     result = IndicatorEngine.rsi(df["close"])
 
     valid = result.dropna()
@@ -70,7 +67,6 @@ def test_rsi():
 
 def test_macd():
     df = make_data()
-
     result = IndicatorEngine.macd(df["close"])
 
     assert "macd" in result.columns
@@ -80,7 +76,6 @@ def test_macd():
 
 def test_atr():
     df = make_data()
-
     result = IndicatorEngine.atr(df)
 
     assert result.dropna().gt(0).all()
@@ -88,7 +83,6 @@ def test_atr():
 
 def test_dmi_adx():
     df = make_data()
-
     result = IndicatorEngine.dmi_adx(df)
 
     assert "plus_di" in result.columns
@@ -101,7 +95,6 @@ def test_dmi_adx():
 
 def test_bollinger_bands():
     df = make_data()
-
     result = IndicatorEngine.bollinger_bands(df["close"])
 
     assert "bb_upper" in result.columns
@@ -110,13 +103,8 @@ def test_bollinger_bands():
 
     valid = result.dropna()
 
-    assert (
-        valid["bb_upper"] >= valid["bb_middle"]
-    ).all()
-
-    assert (
-        valid["bb_middle"] >= valid["bb_lower"]
-    ).all()
+    assert (valid["bb_upper"] >= valid["bb_middle"]).all()
+    assert (valid["bb_middle"] >= valid["bb_lower"]).all()
 
 
 def test_obv():
@@ -132,7 +120,6 @@ def test_obv():
 
 def test_supertrend():
     df = make_data()
-
     result = IndicatorEngine.supertrend(df)
 
     assert "supertrend" in result.columns
@@ -147,7 +134,6 @@ def test_supertrend():
 
 def test_calculate_all():
     df = make_data()
-
     result = IndicatorEngine.calculate_all(df)
 
     expected_columns = [
@@ -193,8 +179,14 @@ def test_supertrend_atr_warmup():
         multiplier=3.0
     )
 
-    assert result["supertrend"].iloc[:10].isna().all()
-    assert result["supertrend"].iloc[10:].notna().any()
+    # ATR 第 10 個有效資料位於索引 9
+    assert result["supertrend"].iloc[:9].isna().all()
+    assert result["supertrend"].iloc[9:].notna().any()
+
+    # ATR 初始化前，趨勢方向應為 0
+    assert (
+        result["supertrend_direction"].iloc[:9] == 0
+    ).all()
 
 
 def test_supertrend_no_future_data_leakage():
@@ -241,7 +233,6 @@ def test_supertrend_no_future_data_leakage():
 def test_supertrend_direction_values():
     """Supertrend 方向只能是多方、空方或初始化狀態。"""
     df = make_data(rows=250)
-
     result = IndicatorEngine.supertrend(df)
 
     assert result["supertrend_direction"].isin(
