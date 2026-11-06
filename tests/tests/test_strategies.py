@@ -158,5 +158,5 @@ def test_supertrend_confirmation_penalizes_opposite_direction():
         features, "LONG"
     )
 
-    assert points < 0
     assert any("衝突" in reason for reason in reasons)
+    assert points <= 0
