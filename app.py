@@ -20,17 +20,25 @@ app = Flask(__name__)
 _scheduler = None
 _scheduler_lock = threading.RLock()
 _scheduler_scanner_class = None
+_scheduler_started = False
 
 
 def get_local_time():
-    return datetime.now(
-        ZoneInfo("Asia/Taipei")
-    ).isoformat()
+    timezone_name = getattr(Config, "TIMEZONE", "Asia/Taipei")
+    return datetime.now(ZoneInfo(timezone_name)).isoformat()
 
 
 def get_scanner():
+    max_symbols = int(
+        getattr(
+            Config,
+            "TOP_N_SYMBOLS",
+            os.getenv("TOP_N_SYMBOLS", "100"),
+        )
+    )
+
     return MarketScanner(
-        max_symbols=int(os.getenv("MAX_SYMBOLS", "100")),
+        max_symbols=max_symbols,
         min_relative_strength=float(
             os.getenv("MIN_RELATIVE_STRENGTH", "0")
         ),
@@ -62,7 +70,11 @@ def get_scheduler():
             scanner=scanner,
             notifier=notifier,
             interval_seconds=int(
-                os.getenv("SCAN_INTERVAL_SECONDS", "300")
+                getattr(
+                    Config,
+                    "SCAN_INTERVAL_SECONDS",
+                    60,
+                )
             ),
             summary_hour=int(
                 os.getenv("SUMMARY_HOUR", "21")
@@ -75,25 +87,67 @@ def get_scheduler():
         return _scheduler
 
 
+def start_scheduler_once():
+    """
+    正式環境收到第一個 HTTP 請求時啟動背景排程。
+    使用鎖避免同一個 Gunicorn worker 重複啟動。
+    """
+
+    global _scheduler_started
+
+    if getattr(Config, "APP_ENV", "development") != "production":
+        return
+
+    with _scheduler_lock:
+        if _scheduler_started:
+            return
+
+        scheduler = get_scheduler()
+        result = scheduler.start()
+
+        if isinstance(result, dict) and result.get("status") in (
+            "started",
+            "already_running",
+        ):
+            _scheduler_started = True
+            app.logger.info(
+                "背景掃描排程已啟動：%s",
+                result,
+            )
+        else:
+            app.logger.error(
+                "背景掃描排程啟動失敗：%s",
+                result,
+            )
+
+
 def reset_scheduler():
     global _scheduler
     global _scheduler_scanner_class
+    global _scheduler_started
 
     with _scheduler_lock:
         if _scheduler is not None:
             try:
                 _scheduler.stop()
             except Exception:
-                pass
+                app.logger.exception("停止 Scheduler 失敗")
 
         _scheduler = None
         _scheduler_scanner_class = None
+        _scheduler_started = False
 
 
 def get_scan_key():
+    """
+    優先使用 config.py 的 ADMIN_API_KEY。
+    保留舊版 SCAN_API_KEY 作為相容設定。
+    """
+
     return (
-        os.getenv("SCAN_API_KEY")
-        or getattr(Config, "SCAN_API_KEY", "")
+        getattr(Config, "ADMIN_API_KEY", "")
+        or os.getenv("ADMIN_API_KEY", "")
+        or os.getenv("SCAN_API_KEY", "")
         or ""
     )
 
@@ -101,8 +155,12 @@ def get_scan_key():
 def check_api_key():
     expected_key = get_scan_key()
 
+    # 沒有設定管理密碼時，正式環境一律拒絕。
     if not expected_key:
-        return True
+        return (
+            getattr(Config, "APP_ENV", "development")
+            != "production"
+        )
 
     supplied_key = (
         request.headers.get("X-Scan-Key")
@@ -121,7 +179,7 @@ def unauthorized_response():
     return jsonify({
         "status": "error",
         "error": "unauthorized",
-        "message": "未授權，請檢查掃描密碼",
+        "message": "未授權，請檢查管理密碼",
     }), 401
 
 
@@ -181,6 +239,7 @@ button {
     color: white;
     font-weight: bold;
 }
+button:disabled { opacity: 0.5; }
 .signal {
     background: #263548;
     border-radius: 8px;
@@ -204,7 +263,7 @@ button {
 
     <div class="panel">
         <strong>市場掃描</strong>
-        <input id="apiKey" type="password" placeholder="輸入掃描密碼">
+        <input id="apiKey" type="password" placeholder="輸入管理密碼">
         <button id="scanButton" onclick="runScan()">立即掃描</button>
         <div id="status" class="muted">等待掃描</div>
     </div>
@@ -360,6 +419,15 @@ async function runScan() {
 """
 
 
+@app.before_request
+def initialize_production_scheduler():
+    """
+    Render 正式環境第一個請求會觸發排程初始化。
+    測試與 development 環境不會自動啟動。
+    """
+    start_scheduler_once()
+
+
 @app.route("/", methods=["GET"])
 def index():
     return render_template_string(DASHBOARD_HTML)
@@ -380,6 +448,8 @@ def health():
         }), 200
 
     except Exception as exc:
+        app.logger.exception("Health check failed")
+
         return jsonify({
             "status": "degraded",
             "application": APP_NAME,
@@ -405,13 +475,8 @@ def api_status():
         "real_trading": False,
         "auto_trading": False,
         "line_configured": line_configured,
-
-        # 主要策略使用的進場週期
         "timeframes": ["1H", "4H"],
-
-        # 高週期作為趨勢背景參考，並未刪除
         "context_timeframes": ["1D", "1W"],
-
         "database_backend": getattr(
             Config, "DATABASE_BACKEND", "sqlite"
         ),
