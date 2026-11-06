@@ -10,7 +10,7 @@ from market_data import MarketData
 
 
 class SignalEngine:
-    """OKX SMART TRADING V1.2 多週期模擬訊號分析引擎。"""
+    """OKX SMART TRADING V1.2.1 多週期模擬訊號分析引擎。"""
 
     TIMEFRAMES = ("1H", "4H")
 
@@ -54,7 +54,10 @@ class SignalEngine:
             "low", "close", "volume"
         ]
 
-        missing = [column for column in required if column not in df.columns]
+        missing = [
+            column for column in required
+            if column not in df.columns
+        ]
 
         if missing:
             raise ValueError(
@@ -62,7 +65,10 @@ class SignalEngine:
             )
 
         for column in required:
-            df[column] = pd.to_numeric(df[column], errors="coerce")
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
 
         df = df.dropna(subset=required)
 
@@ -70,7 +76,10 @@ class SignalEngine:
             raise ValueError("Candle data has no valid rows")
 
         df = df.sort_values("timestamp")
-        df = df.drop_duplicates(subset=["timestamp"], keep="last")
+        df = df.drop_duplicates(
+            subset=["timestamp"],
+            keep="last"
+        )
         df = df.reset_index(drop=True)
 
         if len(df) < 30:
@@ -110,37 +119,71 @@ class SignalEngine:
         result = self.indicator_engine.calculate_all(df.copy())
 
         if not isinstance(result, pd.DataFrame) or result.empty:
-            raise ValueError("Indicator engine returned invalid data")
+            raise ValueError(
+                "Indicator engine returned invalid data"
+            )
 
         return result
 
     @staticmethod
     def _extract_relative_strength(data):
         """
-        保留有效的 1H／4H 相對強弱數值。
-        缺失資料回傳 None，交由策略引擎限制分數。
+        擷取 1H／4H 相對 BTC 強弱。
+        無效資料保留為 None，後續必須通過驗證。
         """
-        values = {"1H": None, "4H": None}
+        values = {
+            "1H": None,
+            "4H": None
+        }
 
         if not isinstance(data, dict):
             return values
 
-        for timeframe in ("1H", "4H"):
+        for timeframe in SignalEngine.TIMEFRAMES:
             item = data.get(timeframe)
 
             if isinstance(item, dict):
-                values[timeframe] = SignalEngine._safe_float(
-                    item.get("relative_strength_pct")
-                )
+                raw_value = item.get("relative_strength_pct")
             else:
-                values[timeframe] = SignalEngine._safe_float(item)
+                raw_value = item
+
+            values[timeframe] = SignalEngine._safe_float(
+                raw_value
+            )
 
         return values
 
     @staticmethod
+    def _validate_relative_strength(relative_strength):
+        """
+        1H 和 4H 必須同時具備有效的相對 BTC 強弱數值。
+        不允許 None、NaN、Infinity 或非數字。
+        """
+        if not isinstance(relative_strength, dict):
+            raise ValueError(
+                "Relative strength data is missing or invalid"
+            )
+
+        for timeframe in SignalEngine.TIMEFRAMES:
+            value = SignalEngine._safe_float(
+                relative_strength.get(timeframe)
+            )
+
+            if value is None:
+                raise ValueError(
+                    f"Missing or invalid BTC relative strength: {timeframe}"
+                )
+
+            relative_strength[timeframe] = value
+
+        return relative_strength
+
+    @staticmethod
     def _normalize_strategy_result(result):
         if not isinstance(result, dict):
-            raise ValueError("Strategy engine returned invalid result")
+            raise ValueError(
+                "Strategy engine returned invalid result"
+            )
 
         normalized = dict(result)
         raw_signals = result.get("signals", [])
@@ -155,16 +198,30 @@ class SignalEngine:
                 continue
 
             signal = dict(raw)
-            name = str(signal.get("signal", "")).upper()
-            direction = str(signal.get("direction", "")).upper()
 
-            score = SignalEngine._safe_float(signal.get("score"))
-            price = SignalEngine._safe_float(signal.get("price"))
+            name = str(
+                signal.get("signal", "")
+            ).upper()
+
+            direction = str(
+                signal.get("direction", "")
+            ).upper()
+
+            score = SignalEngine._safe_float(
+                signal.get("score")
+            )
+
+            price = SignalEngine._safe_float(
+                signal.get("price")
+            )
 
             if name not in SignalEngine.STRATEGY_NAMES:
                 continue
 
-            expected = "LONG" if name.startswith("LONG") else "SHORT"
+            expected = (
+                "LONG" if name.startswith("LONG")
+                else "SHORT"
+            )
 
             if direction != expected:
                 continue
@@ -183,7 +240,11 @@ class SignalEngine:
             signal["price"] = price
 
             reasons = signal.get("reasons", [])
-            signal["reasons"] = reasons if isinstance(reasons, list) else []
+
+            signal["reasons"] = (
+                reasons if isinstance(reasons, list)
+                else []
+            )
 
             signal["candidate"] = True
             signal["status"] = "simulation_only"
@@ -199,6 +260,7 @@ class SignalEngine:
 
         if valid_signals:
             best = valid_signals[0]
+
             normalized.update({
                 "direction": best["direction"],
                 "candidate": True,
@@ -218,18 +280,24 @@ class SignalEngine:
             })
 
         normalized["status"] = "simulation_only"
+
         return normalized
 
     @staticmethod
     def _extract_latest_atr(features):
-        if not isinstance(features, pd.DataFrame) or features.empty:
+        if (
+            not isinstance(features, pd.DataFrame)
+            or features.empty
+        ):
             return None
 
         for column in ("atr", "atr_14"):
             if column not in features.columns:
                 continue
 
-            value = SignalEngine._safe_float(features.iloc[-1][column])
+            value = SignalEngine._safe_float(
+                features.iloc[-1][column]
+            )
 
             if value is not None and value > 0:
                 return value
@@ -259,6 +327,7 @@ class SignalEngine:
                     "reason": "Invalid or missing entry price",
                     "auto_trading": False
                 }
+
                 plans[name] = plan
                 signal["trade_plan"] = plan
                 continue
@@ -273,14 +342,20 @@ class SignalEngine:
                 )
 
                 if not isinstance(plan, dict):
-                    raise ValueError("Risk manager returned invalid trade plan")
+                    raise ValueError(
+                        "Risk manager returned invalid trade plan"
+                    )
 
                 plan = dict(plan)
+
                 plan.update({
                     "symbol": symbol,
                     "strategy": name,
                     "direction": direction,
-                    "status": plan.get("status", "simulation_only"),
+                    "status": plan.get(
+                        "status",
+                        "simulation_only"
+                    ),
                     "auto_trading": False
                 })
 
@@ -296,6 +371,7 @@ class SignalEngine:
                     "reason": str(exc),
                     "auto_trading": False
                 }
+
                 plans[name] = plan
                 signal["trade_plan"] = plan
 
@@ -304,7 +380,9 @@ class SignalEngine:
     @staticmethod
     def _select_best_trade_plan(signals, trade_plans):
         for signal in signals:
-            plan = trade_plans.get(signal.get("signal"))
+            plan = trade_plans.get(
+                signal.get("signal")
+            )
 
             if not isinstance(plan, dict):
                 continue
@@ -327,15 +405,24 @@ class SignalEngine:
             symbol = inst_id
 
             if not inst_id.endswith("-USDT-SWAP"):
-                raise ValueError("Only USDT perpetual swaps are supported")
+                raise ValueError(
+                    "Only USDT perpetual swaps are supported"
+                )
 
             if inst_id == "BTC-USDT-SWAP":
                 raise ValueError(
                     "BTC is the benchmark and cannot be analyzed against itself"
                 )
 
-            df_1h = self._get_confirmed_candles(inst_id, "1H")
-            df_4h = self._get_confirmed_candles(inst_id, "4H")
+            df_1h = self._get_confirmed_candles(
+                inst_id,
+                "1H"
+            )
+
+            df_4h = self._get_confirmed_candles(
+                inst_id,
+                "4H"
+            )
 
             features_1h = self._prepare_features(df_1h)
             features_4h = self._prepare_features(df_4h)
@@ -348,7 +435,18 @@ class SignalEngine:
                 )
             )
 
-            relative_strength = self._extract_relative_strength(relative_data)
+            relative_strength = self._extract_relative_strength(
+                relative_data
+            )
+
+            # 關鍵修正：
+            # 1H／4H 任何一個相對強弱資料無效，
+            # 立即停止分析，不讓不完整資料進入策略引擎。
+            relative_strength = (
+                self._validate_relative_strength(
+                    relative_strength
+                )
+            )
 
             strategy_result = self.strategy_engine.analyze(
                 inst_id,
@@ -358,7 +456,9 @@ class SignalEngine:
                 relative_strength_4h=relative_strength["4H"]
             )
 
-            strategy = self._normalize_strategy_result(strategy_result)
+            strategy = self._normalize_strategy_result(
+                strategy_result
+            )
 
             if not strategy["signals"]:
                 return {
@@ -389,9 +489,11 @@ class SignalEngine:
                 equity=equity
             )
 
-            selected_signal, trade_plan = self._select_best_trade_plan(
-                strategy["signals"],
-                plans
+            selected_signal, trade_plan = (
+                self._select_best_trade_plan(
+                    strategy["signals"],
+                    plans
+                )
             )
 
             return {
@@ -404,7 +506,8 @@ class SignalEngine:
                 "strategy_trade_plans": plans,
                 "trade_plan": trade_plan,
                 "selected_signal": (
-                    selected_signal["signal"] if selected_signal else None
+                    selected_signal["signal"]
+                    if selected_signal else None
                 ),
                 "atr": atr,
                 "trading_mode": "simulation_only",
@@ -433,6 +536,9 @@ class SignalEngine:
 
     def analyze_multiple(self, symbols, equity=None):
         return [
-            self.analyze_symbol(symbol, equity=equity)
+            self.analyze_symbol(
+                symbol,
+                equity=equity
+            )
             for symbol in symbols
         ]
