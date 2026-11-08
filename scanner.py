@@ -36,13 +36,10 @@ class MarketScanner:
         )
 
         self.max_symbols = max(1, min(int(max_symbols), 100))
-
         self.min_relative_strength = float(min_relative_strength)
 
         if not math.isfinite(self.min_relative_strength):
-            raise ValueError(
-                "min_relative_strength must be finite"
-            )
+            raise ValueError("min_relative_strength must be finite")
 
     @staticmethod
     def _safe_float(value, default=None):
@@ -68,7 +65,6 @@ class MarketScanner:
 
         for key in ("score", "signal_score", "total_score"):
             value = cls._safe_float(strategy.get(key))
-
             if value is not None:
                 return value
 
@@ -117,26 +113,8 @@ class MarketScanner:
     def _get_relative_strength(cls, result):
         """
         讀取 1H、4H BTC 相對強弱。
-
-        新格式：
-        {
-            "1H": {
-                "relative_strength_pct": 2.5
-            },
-            "4H": {
-                "relative_strength_pct": 4.2
-            }
-        }
-
-        舊格式：
-        {
-            "1H": 2.5,
-            "4H": 4.2
-        }
-
         缺少任一週期資料時回傳 None。
         """
-
         if not isinstance(result, dict):
             return None
 
@@ -155,7 +133,6 @@ class MarketScanner:
                     item.get("relative_strength_pct")
                 )
             else:
-                # 相容舊版純數字資料。
                 value = cls._safe_float(item)
 
             if value is None:
@@ -168,9 +145,7 @@ class MarketScanner:
     @staticmethod
     def _get_symbols_from_rows(market_rows):
         if not isinstance(market_rows, list):
-            raise ValueError(
-                "Market data must return a list"
-            )
+            raise ValueError("Market data must return a list")
 
         symbols = []
         seen = set()
@@ -203,7 +178,6 @@ class MarketScanner:
         )
 
         symbols = self._get_symbols_from_rows(market_rows)
-
         return symbols[:self.max_symbols]
 
     @staticmethod
@@ -246,12 +220,24 @@ class MarketScanner:
 
     @classmethod
     def _build_strategy_candidate(cls, item, signal):
+        if not isinstance(item, dict):
+            return None
+
         if not isinstance(signal, dict):
             return None
 
-        name = str(
-            signal.get("signal", "")
-        ).upper()
+        # 只接受有效的 OKX USDT 永續合約代號。
+        symbol = item.get("symbol")
+
+        if not isinstance(symbol, str) or not symbol.strip():
+            return None
+
+        symbol = symbol.strip().upper()
+
+        if not symbol.endswith("-USDT-SWAP"):
+            return None
+
+        name = str(signal.get("signal", "")).upper()
 
         if name not in cls.STRATEGY_NAMES:
             return None
@@ -298,7 +284,7 @@ class MarketScanner:
             reasons = []
 
         candidate = {
-            "symbol": item.get("symbol"),
+            "symbol": symbol,
             "strategy": name,
             "direction": direction,
             "score": score,
@@ -345,7 +331,6 @@ class MarketScanner:
 
     def scan(self, equity=None):
         started_at = self._timestamp()
-
         empty_lists = self._empty_strategy_lists()
 
         try:
@@ -391,11 +376,7 @@ class MarketScanner:
 
                 result = dict(result)
 
-                result["symbol"] = result.get(
-                    "symbol",
-                    symbol
-                )
-
+                result["symbol"] = result.get("symbol", symbol)
                 result["scan_symbol"] = symbol
 
                 if result.get("status") not in (
@@ -420,9 +401,7 @@ class MarketScanner:
                 results.append(result)
 
             except Exception as exc:
-                results.append(
-                    self._error_result(symbol, exc)
-                )
+                results.append(self._error_result(symbol, exc))
 
         successful = [
             item for item in results
@@ -463,7 +442,6 @@ class MarketScanner:
                 relative_strength
             )
 
-            # 缺少相對強弱資料的幣種不進入強勢排行榜。
             if (
                 relative_strength is not None
                 and relative_strength >= self.min_relative_strength
@@ -480,10 +458,7 @@ class MarketScanner:
 
             for signal in signals:
                 strategy_candidate = (
-                    self._build_strategy_candidate(
-                        item,
-                        signal
-                    )
+                    self._build_strategy_candidate(item, signal)
                 )
 
                 if strategy_candidate is None:
